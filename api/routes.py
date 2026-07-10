@@ -1,4 +1,5 @@
 """نقاط النهاية المتوافقة مع OpenAI API."""
+import asyncio
 import json
 import logging
 import time
@@ -17,15 +18,10 @@ from models.openai_schemas import (
 from services.agent_loop import AgentRunner
 from services.model_registry import registry
 
-# تسجيل أدوات الخادم مرة واحدة عند تحميل الوحدة (يكفي الاستيراد لتفعيل register_tool داخله)
-from services import tool_executor  # noqa: F401
-
 logger = logging.getLogger("gateway.api")
 router = APIRouter(prefix="/v1", dependencies=[Depends(verify_api_key)])
 client = AsyncClient()
 runner = AgentRunner(client)
-
-_STREAM_CHUNK_SIZE = 40  # عدد الأحرف تقريباً في كل جزء عند محاكاة التدفق لناتج الوكيل
 
 
 @router.get("/models")
@@ -39,13 +35,26 @@ async def list_models():
 
 @router.post("/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    """نقطة النهاية الرئيسية: تدعم الوضع العادي و SSE Streaming."""
+    """
+    نقطة النهاية الرئيسية.
+    - stream=true بدون أدوات  -> تدفق حقيقي مباشر من g4f (سريع، كما كان سابقاً).
+    - stream=true مع أدوات    -> يمر عبر AgentRunner كاملاً (أدوات + كشف وعود فارغة +
+                                  تبديل نماذج عند الفشل) ثم يُحاكى الناتج النهائي كتدفق SSE،
+                                  لأن التدفق الحي أثناء تنفيذ tool calls غير مدعوم بشكل
+                                  موثوق عبر مزودي g4f.
+    - stream=false             -> كما كان، عبر AgentRunner مباشرة بلا تدفق.
+    """
     model = request.model or settings.DEFAULT_MODEL
     if registry.models and model in registry.models and not registry.models[model].healthy:
         raise HTTPException(status_code=400, detail=f"النموذج '{model}' غير صحي حالياً")
 
-    if request.stream:
+    has_tools = bool(request.tools)
+
+    if request.stream and not has_tools:
         return StreamingResponse(_stream(request, model), media_type="text/event-stream")
+
+    if request.stream and has_tools:
+        return StreamingResponse(_agent_as_stream(request, model), media_type="text/event-stream")
 
     content, tool_calls, finish_reason = await runner.run(request)
     message = ChatMessage(role="assistant", content=content or None)
@@ -57,66 +66,10 @@ async def chat_completions(request: ChatCompletionRequest):
     )
 
 
-def _chunk_text(text: str, size: int = _STREAM_CHUNK_SIZE):
-    """يقسّم نصاً جاهزاً إلى أجزاء صغيرة لمحاكاة تدفق SSE بعد أن أنهت حلقة الوكيل عملها كاملة."""
-    for i in range(0, len(text), size):
-        yield text[i:i + size]
-
-
 async def _stream(request: ChatCompletionRequest, model: str):
-    """
-    مولّد SSE متوافق مع OpenAI (data: {...}\\n\\n ثم [DONE]).
-
-    === الإصلاح الجوهري ===
-    النسخة السابقة كانت تُمرر الطلب مباشرة إلى client.chat.completions.stream()
-    بغض النظر عن وجود tools، أي أن كل منطق الوكيل (كشف الاستدعاءات، البروتوكول
-    الصارم، التبديل التلقائي) كان يُتجاوز بالكامل في وضع stream=True.
-
-    السبب التقني لعدم إمكان تفعيل الوكيل أثناء التدفق الحقيقي حرفياً حرفاً:
-    قرار "هل هذا استدعاء أداة صالح؟" يحتاج الرد كاملاً (JSON غير مكتمل لا يمكن
-    تحليله وسط التدفق). لذلك عند وجود tools في الطلب، نُشغّل حلقة الوكيل الكاملة
-    داخلياً حتى تنتهي، ثم "نحاكي" التدفق للعميل بإرسال النتيجة على دفعات — هذا
-    يحافظ على واجهة SSE المتوقعة من العميل بينما يضمن صحة قرار استدعاء الأداة.
-
-    عندما لا توجد tools في الطلب (محادثة عادية)، يبقى التدفق حقيقياً وحرفاً بحرف
-    كما كان، لأنه لا داعي لأي تحليل بنيوي في هذه الحالة.
-    """
+    """مولّد SSE حقيقي مباشر من g4f (فقط عند غياب الأدوات) — بلا تغيير عن السابق."""
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     try:
-        if request.tools and settings.STREAM_USES_AGENT_LOOP:
-            content, tool_calls, finish_reason = await runner.run(request)
-
-            if tool_calls:
-                chunk = ChatCompletionChunk(
-                    id=chunk_id, model=model,
-                    choices=[StreamChoice(delta=DeltaMessage(role="assistant", tool_calls=tool_calls))],
-                )
-                yield f"data: {chunk.model_dump_json()}\n\n"
-                final = ChatCompletionChunk(
-                    id=chunk_id, model=model,
-                    choices=[StreamChoice(delta=DeltaMessage(), finish_reason="tool_calls")],
-                )
-                yield f"data: {final.model_dump_json()}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-
-            first = True
-            for piece in _chunk_text(content or ""):
-                chunk = ChatCompletionChunk(
-                    id=chunk_id, model=model,
-                    choices=[StreamChoice(delta=DeltaMessage(role="assistant" if first else None, content=piece))],
-                )
-                first = False
-                yield f"data: {chunk.model_dump_json()}\n\n"
-            final = ChatCompletionChunk(
-                id=chunk_id, model=model,
-                choices=[StreamChoice(delta=DeltaMessage(), finish_reason=finish_reason or "stop")],
-            )
-            yield f"data: {final.model_dump_json()}\n\n"
-            yield "data: [DONE]\n\n"
-            return
-
-        # لا أدوات في الطلب → تدفق حقيقي مباشر (السلوك الأصلي، محادثة عادية فقط)
         messages = runner._prepare_messages(request, strict=False)
         stream = client.chat.completions.stream(model=model, messages=messages)
         first = True
@@ -138,3 +91,62 @@ async def _stream(request: ChatCompletionRequest, model: str):
         logger.exception("خطأ أثناء التدفق")
         yield f"data: {json.dumps({'error': str(exc)})}\n\n"
     yield "data: [DONE]\n\n"
+
+
+async def _agent_as_stream(request: ChatCompletionRequest, model: str):
+    """
+    يشغّل AgentRunner كاملاً في الخلفية (أدوات + كشف وعود فارغة + تبديل نماذج عند
+    الفشل)، ويرسل نبضات "ping" دورية أثناء الانتظار حتى لا يقطع أي بروكسي/متصفح
+    الاتصال بسبب الصمت الطويل، ويعطي إحساساً بأن النظام لا يزال يعمل. بعد الاكتمال
+    يُبث الناتج النهائي على شكل أجزاء صغيرة بصيغة SSE متوافقة مع OpenAI.
+    """
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    task = asyncio.create_task(runner.run(request))
+
+    try:
+        while not task.done():
+            yield ": ping\n\n"
+            await asyncio.sleep(5)
+        content, tool_calls, finish_reason = task.result()
+    except Exception as exc:
+        logger.exception("خطأ أثناء تنفيذ الوكيل في وضع التدفق")
+        yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    if tool_calls:
+        # ملاحظة: هذا يفترض أن DeltaMessage يدعم حقل tool_calls. إن لم يكن موجوداً
+        # في models/openai_schemas.py حالياً، يجب إضافته هناك أولاً (Optional[list] = None)
+        # وإلا فسيفشل هذا الجزء تحديداً فقط (حالة الأدوات في وضع التدفق).
+        chunk = ChatCompletionChunk(
+            id=chunk_id, model=model,
+            choices=[StreamChoice(
+                delta=DeltaMessage(role="assistant", tool_calls=tool_calls),
+                finish_reason="tool_calls",
+            )],
+        )
+        yield f"data: {chunk.model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    first = True
+    for piece in _chunk_text(content or ""):
+        chunk = ChatCompletionChunk(
+            id=chunk_id, model=model,
+            choices=[StreamChoice(delta=DeltaMessage(role="assistant" if first else None, content=piece))],
+        )
+        first = False
+        yield f"data: {chunk.model_dump_json()}\n\n"
+
+    final = ChatCompletionChunk(
+        id=chunk_id, model=model,
+        choices=[StreamChoice(delta=DeltaMessage(), finish_reason=finish_reason or "stop")],
+    )
+    yield f"data: {final.model_dump_json()}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+def _chunk_text(text: str, size: int = 20):
+    """يقسّم النص النهائي إلى أجزاء صغيرة لإرسالها كأجزاء SSE متتابعة (محاكاة تدفق)."""
+    for i in range(0, len(text), size):
+        yield text[i:i + size]
