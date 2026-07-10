@@ -109,36 +109,43 @@ async def _call_any_tool(arguments: dict) -> str:
         return json.dumps({"error": "الحقل 'tool' مطلوب في الوسائط"}, ensure_ascii=False)
 
     payload = {"tool": tool_name, "arguments": tool_args}
+    
+    # ✅ التعديل 1: إضافة مهلة زمنية 30 ثانية
+    timeout = aiohttp.ClientTimeout(total=30)
+    session = None
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get("ok"):
-                        # إرجاع النتيجة مع ترجمة المفاتيح لتكون واضحة للوكيل
-                        result = data.get("result", {})
-                        if isinstance(result, dict) and "file_url" in result:
-                            # إذا كانت النتيجة تحتوي على رابط ملف، نعطي رسالة واضحة
-                            return json.dumps({
-                                "status": "success",
-                                "file_url": result["file_url"],
-                                "message": f"تم تنفيذ {tool_name} بنجاح. رابط الملف: {result['file_url']}"
-                            }, ensure_ascii=False)
+        session = aiohttp.ClientSession(timeout=timeout)
+        async with session.post(url, json=payload) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get("ok"):
+                    result = data.get("result", {})
+                    if isinstance(result, dict) and "file_url" in result:
                         return json.dumps({
                             "status": "success",
-                            "result": result
+                            "file_url": result["file_url"],
+                            "message": f"تم تنفيذ {tool_name} بنجاح. رابط الملف: {result['file_url']}"
                         }, ensure_ascii=False)
-                    else:
-                        return json.dumps({
-                            "status": "error",
-                            "error": data.get("error", f"فشل تنفيذ الأداة {tool_name}")
-                        }, ensure_ascii=False)
+                    return json.dumps({
+                        "status": "success",
+                        "result": result
+                    }, ensure_ascii=False)
                 else:
                     return json.dumps({
                         "status": "error",
-                        "error": f"خطأ في الاتصال بالباك اند: {response.status}"
+                        "error": data.get("error", f"فشل تنفيذ الأداة {tool_name}")
                     }, ensure_ascii=False)
+            else:
+                return json.dumps({
+                    "status": "error",
+                    "error": f"خطأ في الاتصال بالباك اند: {response.status}"
+                }, ensure_ascii=False)
+    except aiohttp.ClientTimeout as e:
+        return json.dumps({
+            "status": "error",
+            "error": f"المهلة الزمنية انتهت (30 ثانية): {str(e)}"
+        }, ensure_ascii=False)
     except aiohttp.ClientError as e:
         return json.dumps({
             "status": "error",
@@ -149,6 +156,10 @@ async def _call_any_tool(arguments: dict) -> str:
             "status": "error",
             "error": f"استثناء غير متوقع: {str(e)}"
         }, ensure_ascii=False)
+    finally:
+        # ✅ التعديل 2: إغلاق الجلسة يدوياً في النهاية
+        if session and not session.closed:
+            await session.close()
 
 # ===== تسجيل الأدوات في SERVER_TOOLS =====
 # الأدوات الأساسية (تعمل محلياً)
