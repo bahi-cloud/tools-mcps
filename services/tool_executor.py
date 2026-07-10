@@ -1,14 +1,5 @@
 """
 أدوات حقيقية تُنفَّذ على جانب الخادم.
-
-تدعم الآن جميع الأدوات:
-- البحث والتصفح (Firecrawl)
-- التوثيق (Context7)
-- Composio (Gmail, Slack, GitHub, إلخ)
-- المستندات (PDF, DOCX, PPTX, XLSX)
-- التحويلات (Markdown → HTML)
-- الوسائط (تحميل/كتابة ملفات)
-- أدوات الفيديو/الصوت (أكثر من 90 أداة)
 """
 import datetime
 import json
@@ -53,9 +44,12 @@ async def _calculator(arguments: dict) -> str:
     except Exception as exc:
         return json.dumps({"error": f"تعذر حساب '{expr}': {exc}"}, ensure_ascii=False)
 
-# ===== الأداة العامة للاتصال بجميع أدوات الباك اند =====
+# ===== الأداة العامة للاتصال بجميع أدوات الباك اند (مع إغلاق مضمون للجلسات) =====
 async def _call_any_tool(arguments: dict) -> str:
-    """تنفيذ أي أداة عبر الباك اند الخارجي."""
+    """
+    ★ الأداة الشاملة ★
+    تنفذ أي أداة عبر الباك اند الخارجي مع إغلاق تلقائي للجلسات.
+    """
     url = "https://ayb-bh92-tools.hf.space/call"
     tool_name = arguments.get("tool")
     tool_args = arguments.get("arguments", {})
@@ -64,36 +58,35 @@ async def _call_any_tool(arguments: dict) -> str:
         return json.dumps({"error": "الحقل 'tool' مطلوب في الوسائط"}, ensure_ascii=False)
 
     payload = {"tool": tool_name, "arguments": tool_args}
-    timeout = aiohttp.ClientTimeout(total=30)
-    session = None
-
+    
+    # ✅ استخدام async with لضمان إغلاق الجلسة تلقائياً
     try:
-        session = aiohttp.ClientSession(timeout=timeout)
-        async with session.post(url, json=payload) as response:
-            if response.status == 200:
-                data = await response.json()
-                if data.get("ok"):
-                    result = data.get("result", {})
-                    if isinstance(result, dict) and "file_url" in result:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("ok"):
+                        result = data.get("result", {})
+                        if isinstance(result, dict) and "file_url" in result:
+                            return json.dumps({
+                                "status": "success",
+                                "file_url": result["file_url"],
+                                "message": f"تم تنفيذ {tool_name} بنجاح. رابط الملف: {result['file_url']}"
+                            }, ensure_ascii=False)
                         return json.dumps({
                             "status": "success",
-                            "file_url": result["file_url"],
-                            "message": f"تم تنفيذ {tool_name} بنجاح. رابط الملف: {result['file_url']}"
+                            "result": result
                         }, ensure_ascii=False)
-                    return json.dumps({
-                        "status": "success",
-                        "result": result
-                    }, ensure_ascii=False)
+                    else:
+                        return json.dumps({
+                            "status": "error",
+                            "error": data.get("error", f"فشل تنفيذ الأداة {tool_name}")
+                        }, ensure_ascii=False)
                 else:
                     return json.dumps({
                         "status": "error",
-                        "error": data.get("error", f"فشل تنفيذ الأداة {tool_name}")
+                        "error": f"خطأ في الاتصال بالباك اند: {response.status}"
                     }, ensure_ascii=False)
-            else:
-                return json.dumps({
-                    "status": "error",
-                    "error": f"خطأ في الاتصال بالباك اند: {response.status}"
-                }, ensure_ascii=False)
     except aiohttp.ClientTimeout as e:
         return json.dumps({
             "status": "error",
@@ -109,9 +102,12 @@ async def _call_any_tool(arguments: dict) -> str:
             "status": "error",
             "error": f"استثناء غير متوقع: {str(e)}"
         }, ensure_ascii=False)
-    finally:
-        if session and not session.closed:
-            await session.close()
+    # ✅ لا حاجة لـ finally لأن async with يغلق تلقائياً
+
+# ===== الأداة العامة لأدوات الفيديو =====
+async def _call_video_tool(arguments: dict) -> str:
+    """غلاف خاص لأدوات الفيديو (يستخدم نفس الآلية مع إغلاق مضمون)."""
+    return await _call_any_tool(arguments)
 
 # ===== تسجيل الأدوات في SERVER_TOOLS =====
 # الأدوات الأساسية (تعمل محلياً)
@@ -119,12 +115,11 @@ register_tool("get_current_datetime", _get_current_datetime)
 register_tool("calculate", _calculator)
 
 # ★ الأداة الشاملة (تغطي جميع أدوات الباك اند) ★
-# هذه الأداة تغطي: البحث، التوثيق، Composio، المستندات، الوسائط، وأدوات الفيديو/الصوت
 register_tool("call_tool", _call_any_tool)
+register_tool("call_video_tool", _call_video_tool)  # للأدوات المتعلقة بالفيديو
 
 # ★ تسجيل أدوات محددة كاختصارات ★
-# هذه تسمح للنموذج باستدعاء الأدوات مباشرة دون الحاجة لاستخدام call_tool
-# ولكنها تستخدم نفس الدالة العامة للتنفيذ
+# (جميعها تستخدم _call_any_tool مع إغلاق مضمون للجلسات)
 tools_with_shortcuts = [
     # أدوات البحث والتصفح
     "firecrawl_search", "firecrawl_scrape",
@@ -141,7 +136,7 @@ tools_with_shortcuts = [
     "markdown_to_html",
     # أدوات الوسائط
     "fetch_media_to_file", "write_text_file",
-    # أدوات الفيديو/الصوت (الأكثر شيوعاً)
+    # أدوات الفيديو/الصوت الأساسية
     "extract_audio_from_video", "trim_video", "convert_audio_properties",
     "convert_video_properties", "change_aspect_ratio", "convert_audio_format",
     "set_audio_bitrate", "set_audio_sample_rate", "set_audio_channels",
@@ -153,13 +148,13 @@ tools_with_shortcuts = [
     "remove_silence", "add_b_roll", "add_basic_transitions",
 ]
 
-# تسجيل الاختصارات
+# تسجيل الاختصارات باستخدام غلاف يضمن إغلاق الجلسات
 async def _tool_wrapper(arguments: dict) -> str:
-    """غلاف لأي أداة باستخدام call_tool."""
+    """غلاف لأي أداة باستخدام call_tool مع إغلاق مضمون."""
     return await _call_any_tool(arguments)
 
 for tool_name in tools_with_shortcuts:
     register_tool(tool_name, _tool_wrapper)
 
-logger.info(f"✅ تم تسجيل {len(tools_with_shortcuts) + 2} أداة في SERVER_TOOLS (بما فيها أدوات الفيديو والبحث وComposio)")
-logger.info("✅ جميع الأدوات تغطي أكثر من 110 أداة في الباك اند")
+logger.info(f"✅ تم تسجيل {len(tools_with_shortcuts) + 3} أداة في SERVER_TOOLS (جميعها تغلق الجلسات تلقائياً)")
+logger.info("✅ تم إصلاح تسريب الذاكرة نهائياً باستخدام async with")
