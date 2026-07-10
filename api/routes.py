@@ -1,6 +1,6 @@
 """
 نقاط النهاية المتوافقة مع OpenAI API.
-إصدار مستقر وهندسي: تم عزل الـ Chat تماماً عن الفلترة، وإصلاح تتابع الـ finish_reason في الـ Streaming.
+الإصدار النهائي والمستقر كلياً: تم إصلاح الـ Follow-up Context وتنظيف البادئات التقنية محافظاً.
 """
 import json
 import logging
@@ -60,17 +60,21 @@ FOLLOW_UP_PATTERNS = [
     r"(save this|convert it|send to)"
 ]
 
-# ==================== الفلتر السطري المحافظ للـ Agent فقط ====================
-
+# تصفية بروتوكولات الوكيل الداخلية والخام
 TECHNICAL_LINE_PATTERNS = [
     re.compile(r"^\s*\[TOOL_CALLS\]\s*:?.*$", re.IGNORECASE),
     re.compile(r"^\s*(thought|action|observation)\s*:\s*.*$", re.IGNORECASE),
 ]
 
+# إزالة البادئة التقنية للإجابة النهائية دون حذف سياق السطر نفسه
+FINAL_PREFIX_PATTERN = re.compile(
+    r"^\s*(?:final|final answer)\s*:\s*",
+    re.IGNORECASE,
+)
+
 def _clean_agent_content(text: str | None) -> str | None:
     """
-    منظف سطري محافظ يعمل فقط على المخرجات النهائية للـ Agent.
-    يحمي كتل التعليمات البرمجية (Code Blocks) تماماً من أي تلاعب.
+    منظف سطري محافظ يحمي الأكواد والـ Markdown، ويزيل فقط العناوين والبادئات التقنية.
     """
     if not text:
         return text
@@ -82,7 +86,6 @@ def _clean_agent_content(text: str | None) -> str | None:
     for line in lines:
         stripped = line.strip()
         
-        # حماية الكود تماماً عند رصد بداية أو نهاية البلوك البرمجي
         if stripped.startswith("```"):
             inside_code_block = not inside_code_block
             cleaned_lines.append(line)
@@ -92,10 +95,11 @@ def _clean_agent_content(text: str | None) -> str | None:
             cleaned_lines.append(line)
             continue
             
-        # تخطي الأسطر التي تمثل بروتوكولات تقنية خام خارج كتل الكود
         if any(pattern.match(line) for pattern in TECHNICAL_LINE_PATTERNS):
             continue
             
+        # إزالة بادئة Final: الذكية مع الحفاظ على محتوى الإجابة
+        line = FINAL_PREFIX_PATTERN.sub("", line)
         cleaned_lines.append(line)
         
     result = "\n".join(cleaned_lines).strip()
@@ -103,7 +107,9 @@ def _clean_agent_content(text: str | None) -> str | None:
 
 
 def _should_use_agent_mode(request: ChatCompletionRequest) -> bool:
-    """موجه محافظ لتحديد وضع الوكيل بناءً على النية التنفيذية المركبة."""
+    """
+    موجه محافظ مصحح: يربط نية المتابعة بوجود سياق استخدام أدوات سابق.
+    """
     if request.tools or getattr(request, 'functions', None):
         logger.info("🎯 ROUTER: mode=agent reason=explicit_tools")
         return True
@@ -124,6 +130,7 @@ def _should_use_agent_mode(request: ChatCompletionRequest) -> bool:
         logger.info("🎯 ROUTER: mode=chat reason=fast_path_greeting")
         return False
 
+    # فحص النية التنفيذية المركبة المباشرة
     if AGENT_EXECUTION_PATTERN.search(last_msg_clean):
         logger.info("🎯 ROUTER: mode=agent reason=composite_execution_intent")
         return True
@@ -132,10 +139,20 @@ def _should_use_agent_mode(request: ChatCompletionRequest) -> bool:
         logger.info("🎯 ROUTER: mode=chat reason=explanation_intent")
         return False
 
-    recent_messages = [m.content for m in request.messages[-3:] if m.role == "user" and m.content]
-    recent_text = " ".join(recent_messages).lower()
-    if any(re.search(p, recent_text) for p in FOLLOW_UP_PATTERNS):
-        logger.info("🎯 ROUTER: mode=agent reason=contextual_follow_up_intent")
+    # تحليل سياق المتابعة التاريخي (Contextual Follow-up) لرسائل المستخدم السابقة
+    previous_user_messages = [
+        m.content for m in request.messages if m.role == "user" and m.content
+    ][:-1]
+    
+    previous_context = " ".join(previous_user_messages[-2:]).lower()
+    
+    has_follow_up = any(re.search(p, last_msg_clean) for p in FOLLOW_UP_PATTERNS)
+    has_previous_tool_context = any(
+        re.search(pattern, previous_context) for pattern in TOOL_RESOURCES.values()
+    )
+
+    if has_follow_up and has_previous_tool_context:
+        logger.info("🎯 ROUTER: mode=agent reason=contextual_follow_up_with_tool_context")
         return True
 
     logger.info("🎯 ROUTER: mode=chat reason=no_execution_intent")
@@ -157,7 +174,6 @@ async def chat_completions(request: ChatCompletionRequest):
     if registry.models and model in registry.models and not registry.models[model].healthy:
         raise HTTPException(status_code=400, detail=f"النموذج '{model}' غير صحي حالياً")
 
-    # 1. فحص الـ stream أولاً وقبل كل شيء لضمان تسليم الـ SSE فوراً
     if request.stream:
         return StreamingResponse(
             _stream(request, model),
@@ -169,12 +185,10 @@ async def chat_completions(request: ChatCompletionRequest):
             }
         )
 
-    # 2. وضع الـ Agent للطلبات غير المتدفقة
     if _should_use_agent_mode(request):
         logger.info("🧠 تشغيل الطلب عبر وضع الوكيل (Non-Streaming Agent)")
         content, tool_calls, finish_reason = await runner.run(request)
         
-        # الفلترة الدفاعية المحافظة فقط على مخرجات الـ Agent النهائية
         content = _clean_agent_content(content)
         
         message = ChatMessage(role="assistant", content=content or None)
@@ -186,7 +200,6 @@ async def chat_completions(request: ChatCompletionRequest):
             choices=[Choice(message=message, finish_reason=finish_reason)],
         )
 
-    # 3. وضع الـ Chat العادي النظيف غير المتدفق (بدون أي تعديل أو فلاتر)
     logger.info("📝 تشغيل الطلب عبر وضع المحادثة العادية (Non-Streaming Chat)")
     messages = runner._prepare_messages(request, strict=False)
     response = await client.chat.completions.create(model=model, messages=messages, stream=False)
@@ -203,11 +216,9 @@ async def _stream(request: ChatCompletionRequest, model: str):
             logger.info("🧠 الوكيل في وضع Agent (انتظار تنفيذ الأدوات بالخلفية)")
             content, tool_calls, finish_reason = await runner.run(request)
 
-            # تطبيق الفلترة الدفاعية السطرية المحافظة بعد اكتمال الـ run
             content = _clean_agent_content(content)
             delta = DeltaMessage(role="assistant", content=content)
 
-            # الإصلاح: الأول يحمل finish_reason=None لمنع إنهاء القراءة مبكراً
             chunk = ChatCompletionChunk(
                 id=chunk_id,
                 model=model,
@@ -215,7 +226,6 @@ async def _stream(request: ChatCompletionRequest, model: str):
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
 
-            # الـ Chunk النهائي يغلق الاتصال بـ الـ finish_reason الفعلي أو stop
             final = ChatCompletionChunk(
                 id=chunk_id,
                 model=model,
@@ -225,7 +235,6 @@ async def _stream(request: ChatCompletionRequest, model: str):
             yield "data: [DONE]\n\n"
             return
 
-        # وضع الـ Chat العادي المتدفق (خام، سريع، وبدون أي فلاتر تشوه الـ Chunks)
         logger.info("📝 الوكيل في وضع Chat (محادثة عادية متدفقة ونظيفة)")
         messages = runner._prepare_messages(request, strict=False)
         stream = client.chat.completions.stream(model=model, messages=messages)
