@@ -1,6 +1,6 @@
 """
 نقاط النهاية المتوافقة مع OpenAI API.
-الإصدار النهائي - يجمع بين السطور المهمة من النسختين.
+الإصدار النهائي - يعطل التدفق في وضع الوكيل، ويفعله في الوضع العادي.
 """
 import json
 import logging
@@ -18,7 +18,7 @@ from models.openai_schemas import (
 )
 from services.agent_loop import AgentRunner
 from services.model_registry import registry
-from services import tool_executor  # ✅ السطر المهم من النسخة الجديدة
+from services import tool_executor  # تفعيل الأدوات
 
 logger = logging.getLogger("gateway.api")
 
@@ -30,7 +30,6 @@ runner = AgentRunner(client)
 
 @router.get("/models")
 async def list_models():
-    """قائمة النماذج الصحية بصيغة OpenAI."""
     return {
         "object": "list",
         "data": [{"id": n, "object": "model", "owned_by": "g4f"} for n in registry.healthy_models()],
@@ -39,7 +38,6 @@ async def list_models():
 
 @router.post("/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    """نقطة النهاية الرئيسية: تدعم الوضع العادي و SSE Streaming."""
     model = request.model or settings.DEFAULT_MODEL
 
     if registry.models and model in registry.models and not registry.models[model].healthy:
@@ -56,7 +54,7 @@ async def chat_completions(request: ChatCompletionRequest):
             }
         )
 
-    # ✅ من النسخة القديمة: استخدام حلقة الوكيل الكاملة
+    # وضع غير تدفقي (يعمل مع الأدوات)
     content, tool_calls, finish_reason = await runner.run(request)
 
     message = ChatMessage(role="assistant", content=content or None)
@@ -72,20 +70,42 @@ async def chat_completions(request: ChatCompletionRequest):
 async def _stream(request: ChatCompletionRequest, model: str):
     """
     مولّد SSE متوافق مع OpenAI.
-    يجمع بين السطور المهمة من النسختين.
+
+    ✅ المنطق الصحيح:
+    - إذا كان هناك أدوات (tool) → نعطل التدفق ونستخدم حلقة الوكيل.
+    - إذا لم يكن هناك أدوات → نفعّل التدفق الحقيقي (محادثة عادية).
     """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     try:
-        # ✅ السطر المهم من النسخة القديمة: تحضير الرسائل
+        # ✅ وضع الوكيل (مع أدوات) → تدفق معطل
+        if request.tools:
+            content, tool_calls, finish_reason = await runner.run(request)
+
+            # إرسال الرد كقطعة واحدة (بدلاً من تدفق حقيقي)
+            delta = DeltaMessage(role="assistant", content=content)
+            if tool_calls:
+                # إرسال استدعاءات الأدوات كـ JSON في المحتوى (لتجنب خطأ DeltaMessage)
+                delta.content = f"{content}\n\n[TOOL_CALLS]: {json.dumps(tool_calls, ensure_ascii=False)}"
+
+            chunk = ChatCompletionChunk(
+                id=chunk_id,
+                model=model,
+                choices=[StreamChoice(delta=delta, finish_reason=finish_reason)],
+            )
+            yield f"data: {chunk.model_dump_json()}\n\n"
+
+            final = ChatCompletionChunk(
+                id=chunk_id,
+                model=model,
+                choices=[StreamChoice(delta=DeltaMessage(), finish_reason="stop")],
+            )
+            yield f"data: {final.model_dump_json()}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # ✅ وضع النموذج العادي (بدون أدوات) → تدفق حقيقي
         messages = runner._prepare_messages(request, strict=False)
-        
-        # ✅ السطر المهم من النسخة الجديدة: تمرير الأدوات في التدفق
-        stream = client.chat.completions.stream(
-            model=model,
-            messages=messages,
-            tools=request.tools or None,
-            tool_choice="auto" if request.tools else None,
-        )
+        stream = client.chat.completions.stream(model=model, messages=messages)
 
         first = True
         async for part in stream:
