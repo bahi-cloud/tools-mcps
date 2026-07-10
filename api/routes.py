@@ -1,9 +1,10 @@
 """
 نقاط النهاية المتوافقة مع OpenAI API.
-الإصدار النهائي - يعطل التدفق في وضع الوكيل، ويفعله في الوضع العادي.
+الإصدار الذكي: يقرر متى يتدفق ومتى يعمل كوكيل.
 """
 import json
 import logging
+import re
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,6 +27,41 @@ router = APIRouter(prefix="/v1", dependencies=[Depends(verify_api_key)])
 
 client = AsyncClient()
 runner = AgentRunner(client)
+
+# الكلمات المفتاحية التي تشير إلى طلب استخدام أداة
+_TOOL_KEYWORDS = re.compile(
+    r"(أنشئ|اقطع|حوّل|استخرج|دمج|أضف|احذف|غيّر|PDF|فيديو|صوت|مستند|word|excel|ppt|ترجمة|تعديل|قص)",
+    re.IGNORECASE
+)
+
+# النماذج التي تدعم الأدوات بشكل طبيعي
+_TOOL_SUPPORTED_MODELS = {"deepseek-r1", "gpt-4o", "command-a", "command-r"}
+
+
+def _should_use_agent_mode(request: ChatCompletionRequest) -> bool:
+    """
+    قرار ذكي: هل يجب أن نستخدم حلقة الوكيل (وضع عدم التدفق) أم لا؟
+
+    المعايير:
+    1. وجود أدوات في الطلب.
+    2. طلب صريح من المستخدم (تحليل النصوص).
+    3. النموذج المستخدم يدعم الأدوات.
+    """
+    # 1. أدوات في الطلب
+    if request.tools:
+        return True
+
+    # 2. طلب صريح من المستخدم
+    user_text = " ".join([m.content for m in request.messages if m.role == "user"])
+    if _TOOL_KEYWORDS.search(user_text):
+        return True
+
+    # 3. النموذج يدعم الأدوات
+    if request.model in _TOOL_SUPPORTED_MODELS:
+        return True
+
+    # افتراضياً: لا نستخدم وضع الوكيل (تدفق عادي)
+    return False
 
 
 @router.get("/models")
@@ -70,21 +106,17 @@ async def chat_completions(request: ChatCompletionRequest):
 async def _stream(request: ChatCompletionRequest, model: str):
     """
     مولّد SSE متوافق مع OpenAI.
-
-    ✅ المنطق الصحيح:
-    - إذا كان هناك أدوات (tool) → نعطل التدفق ونستخدم حلقة الوكيل.
-    - إذا لم يكن هناك أدوات → نفعّل التدفق الحقيقي (محادثة عادية).
+    يقرر تلقائياً: هل يتدفق حرفياً أم يستخدم الوكيل (معطل التدفق).
     """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     try:
-        # ✅ وضع الوكيل (مع أدوات) → تدفق معطل
-        if request.tools:
+        # ✅ القرار الذكي: هل نستخدم وضع الوكيل؟
+        if _should_use_agent_mode(request):
+            logger.info("🧠 الوكيل في وضع Agent (التدفق معطل)")
             content, tool_calls, finish_reason = await runner.run(request)
 
-            # إرسال الرد كقطعة واحدة (بدلاً من تدفق حقيقي)
             delta = DeltaMessage(role="assistant", content=content)
             if tool_calls:
-                # إرسال استدعاءات الأدوات كـ JSON في المحتوى (لتجنب خطأ DeltaMessage)
                 delta.content = f"{content}\n\n[TOOL_CALLS]: {json.dumps(tool_calls, ensure_ascii=False)}"
 
             chunk = ChatCompletionChunk(
@@ -103,7 +135,8 @@ async def _stream(request: ChatCompletionRequest, model: str):
             yield "data: [DONE]\n\n"
             return
 
-        # ✅ وضع النموذج العادي (بدون أدوات) → تدفق حقيقي
+        # ✅ وضع النموذج العادي (تدفق حقيقي)
+        logger.info("📝 الوكيل في وضع Chat (التدفق مفعل)")
         messages = runner._prepare_messages(request, strict=False)
         stream = client.chat.completions.stream(model=model, messages=messages)
 
