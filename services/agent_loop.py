@@ -17,11 +17,6 @@ from services.tool_processor import normalize_tool_calls, validate_call, extract
 
 logger = logging.getLogger("gateway.agent")
 
-# --- إضافة: حد أقصى لعدد تبديلات النموذج عند الفشل التقني، حتى لا تتراكم عدة
-# انتظارات كاملة لـ REQUEST_TIMEOUT قبل الوصول لسقف الـ120 ثانية. ثابت محلي هنا
-# (وليس في settings) حتى لا يتعطل الملف إن لم تُضِف الحقل هناك.
-MAX_MODEL_SWITCHES = 2
-
 # --- أدوات الخادم (تُملأ من tool_executor.py) ---
 ToolExecutor = Callable[[dict], Awaitable[str]]
 SERVER_TOOLS: dict[str, ToolExecutor] = {}
@@ -130,17 +125,12 @@ class AgentRunner:
                 format_attempts, settings.MAX_FORMAT_RETRIES, model,
             )
 
-            # --- استدعاء النموذج مع تبديل تلقائي عند الفشل (محدود بـ MAX_MODEL_SWITCHES) ---
+            # --- استدعاء النموذج مع تبديل تلقائي عند الفشل ---
             try:
                 resp = await self._call_model(model, messages, request)
             except Exception as exc:
                 logger.warning("فشل الاستدعاء على النموذج '%s': %s", model, exc)
                 failed_models.append(model)
-                # --- إضافة: لا نبدّل أكثر من MAX_MODEL_SWITCHES مرة، لتفادي تراكم
-                # عدة انتظارات REQUEST_TIMEOUT متتالية قبل الوصول لسقف الـ120 ثانية.
-                if len(failed_models) > MAX_MODEL_SWITCHES:
-                    logger.error("تجاوزنا الحد الأقصى لتبديل النماذج (%d)، إيقاف المحاولة", MAX_MODEL_SWITCHES)
-                    raise
                 fallback = self._next_healthy_model(model, failed_models)
                 if fallback:
                     logger.info("🔄 تبديل تلقائي إلى نموذج بديل سليم: %s", fallback)
