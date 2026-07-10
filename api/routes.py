@@ -24,7 +24,6 @@ logger = logging.getLogger("gateway.api")
 
 router = APIRouter(prefix="/v1", dependencies=[Depends(verify_api_key)])
 
-# عميل g4f وحلقة الوكيل
 client = AsyncClient()
 runner = AgentRunner(client)
 
@@ -43,11 +42,9 @@ async def chat_completions(request: ChatCompletionRequest):
     """نقطة النهاية الرئيسية: تدعم الوضع العادي و SSE Streaming."""
     model = request.model or settings.DEFAULT_MODEL
 
-    # التحقق من صحة النموذج
     if registry.models and model in registry.models and not registry.models[model].healthy:
         raise HTTPException(status_code=400, detail=f"النموذج '{model}' غير صحي حالياً")
 
-    # وضع التدفق (Streaming)
     if request.stream:
         return StreamingResponse(
             _stream(request, model),
@@ -59,7 +56,6 @@ async def chat_completions(request: ChatCompletionRequest):
             }
         )
 
-    # وضع غير تدفقي (Non-streaming)
     content, tool_calls, finish_reason = await runner.run(request)
 
     message = ChatMessage(role="assistant", content=content or None)
@@ -75,52 +71,28 @@ async def chat_completions(request: ChatCompletionRequest):
 async def _stream(request: ChatCompletionRequest, model: str):
     """
     مولّد SSE متوافق مع OpenAI (data: {...}\\n\\n ثم [DONE]).
-    يعمل مع الأدوات عبر AgentRunner في وضع التدفق.
+    ✅ الإصدار القديم مع إصلاح بسيط لتفادي خطأ tool_calls.
     """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     try:
-        # ✅ الإصلاح: استخدام AgentRunner للتدفق مع الأدوات
-        # إذا كان هناك أدوات، استخدم حلقة الوكيل للحصول على الرد
-        if request.tools:
-            # استخدم AgentRunner للحصول على الرد (غير تدفقي داخلياً)
-            content, tool_calls, finish_reason = await runner.run(request)
+        # ✅ الإصلاح: استخدام AgentRunner للحصول على الرد (غير تدفقي)
+        content, tool_calls, finish_reason = await runner.run(request)
 
-            # أرسل الرد كقطعة واحدة
-            delta = DeltaMessage(role="assistant", content=content)
-            if tool_calls:
-                # ✅ إصلاح: تمرير tool_calls في DeltaMessage
-                delta.tool_calls = tool_calls
+        # بناء الـ DeltaMessage دون استخدام tool_calls (لتجنب الخطأ)
+        delta = DeltaMessage(role="assistant", content=content)
+        
+        # ✅ إذا كانت هناك tool_calls، نرسلها كجزء من الـ content (حل مؤقت)
+        if tool_calls:
+            # تحويل tool_calls إلى نص JSON وإضافته للمحتوى
+            tool_calls_text = json.dumps(tool_calls, ensure_ascii=False)
+            delta.content = f"{content}\n\n[TOOL_CALLS]: {tool_calls_text}"
 
-            chunk = ChatCompletionChunk(
-                id=chunk_id,
-                model=model,
-                choices=[StreamChoice(delta=delta, finish_reason=finish_reason)],
-            )
-            yield f"data: {chunk.model_dump_json()}\n\n"
-        else:
-            # لا توجد أدوات → تمرير مباشر من g4f
-            messages = runner._prepare_messages(request, strict=False)
-            stream = client.chat.completions.stream(
-                model=model,
-                messages=messages,
-                # ✅ الإصلاح: تمرير الأدوات رسمياً في وضع التدفق
-                tools=request.tools or None,
-                tool_choice="auto" if request.tools else None,
-            )
-
-            first = True
-            async for part in stream:
-                delta_content = part.choices[0].delta.content if part.choices else None
-                if delta_content:
-                    chunk = ChatCompletionChunk(
-                        id=chunk_id,
-                        model=model,
-                        choices=[StreamChoice(
-                            delta=DeltaMessage(role="assistant" if first else None, content=delta_content),
-                        )],
-                    )
-                    first = False
-                    yield f"data: {chunk.model_dump_json()}\n\n"
+        chunk = ChatCompletionChunk(
+            id=chunk_id,
+            model=model,
+            choices=[StreamChoice(delta=delta, finish_reason=finish_reason)],
+        )
+        yield f"data: {chunk.model_dump_json()}\n\n"
 
         # نهاية البث
         final_chunk = ChatCompletionChunk(
