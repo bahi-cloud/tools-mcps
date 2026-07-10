@@ -14,12 +14,6 @@ from services.tool_processor import normalize_tool_calls, validate_call
 
 logger = logging.getLogger("gateway.agent")
 
-# ثوابت زمن ثابتة داخل هذا الملف نفسه (لا تعتمد على config.py) لضمان سقف
-# زمني مضمون بغض النظر عن القيم الموجودة هناك.
-PER_CALL_TIMEOUT = 25.0       # مهلة كل نداء فردي لأي نموذج
-TOTAL_MAX_ATTEMPTS = 2        # الحد الأقصى الكلي لعدد نداءات النموذج (أي سبب: فشل تقني أو وعد فارغ)
-GLOBAL_BUDGET = 40.0          # سقف صارم لكامل الطلب
-
 # أفعال مستقبلية تدل على وعد فارغ (عربي/إنجليزي)
 _HEDGING = re.compile(
     r"(سأقوم|سأفعل|سأتحقق|سأبحث|سوف أ|دعني|لحظة من فضلك|i will|i'll|let me|going to|one moment)",
@@ -75,10 +69,10 @@ class AgentRunner:
         try:
             return await asyncio.wait_for(
                 self._run_inner(request),
-                timeout=GLOBAL_BUDGET,
+                timeout=settings.GLOBAL_REQUEST_BUDGET,
             )
         except asyncio.TimeoutError:
-            logger.error("تجاوز الطلب السقف الزمني الكلي (%ss)", GLOBAL_BUDGET)
+            logger.error("تجاوز الطلب السقف الزمني الكلي (%ss)", settings.GLOBAL_REQUEST_BUDGET)
             return "انتهت مهلة الطلب الكلية، حاول مرة أخرى أو اختر نموذجاً آخر.", [], "stop"
 
     async def _run_inner(self, request: ChatCompletionRequest) -> tuple[str, list, str]:
@@ -86,34 +80,35 @@ class AgentRunner:
         حلقة التنفيذ الفعلية. تُرجع (المحتوى النهائي, استدعاءات أدوات للعميل, finish_reason).
         """
         model = request.model or settings.DEFAULT_MODEL
-        attempts = 0                 # عداد موحّد: كل نداء نموذج (لأي سبب) يُحتسب هنا
+        attempts = 0
+        hedge_attempts = 0
         strict = False
         working_messages: Optional[list[dict]] = None
         tried_models = [model]
         content = ""
 
-        while attempts < TOTAL_MAX_ATTEMPTS:
+        while attempts < settings.MAX_TOOL_RETRIES:
             attempts += 1
             messages = working_messages or self._prepare_messages(request, strict)
-            logger.info("محاولة %d/%d على النموذج %s", attempts, TOTAL_MAX_ATTEMPTS, model)
+            logger.info("محاولة %d/%d على النموذج %s", attempts, settings.MAX_TOOL_RETRIES, model)
 
             try:
                 resp = await asyncio.wait_for(
                     self.client.chat.completions.create(model=model, messages=messages),
-                    timeout=PER_CALL_TIMEOUT,
+                    timeout=settings.REQUEST_TIMEOUT,
                 )
             except Exception as exc:
-                # فشل تقني: إن بقيت محاولات، بدّل لنموذج صحي آخر ضمن نفس عداد المحاولات
-                # (لا يوجد عداد منفصل يسمح بتراكم إضافي فوق TOTAL_MAX_ATTEMPTS).
+                # فشل تقني (مهلة/خطأ من المزود) وليس "وعداً فارغاً" -> لا داعي لإعادة
+                # المحاولة على نفس النموذج المعطوب، بل التبديل الفوري لنموذج صحي آخر.
                 logger.warning("فشل تقني على النموذج %s: %s", model, exc)
-                if attempts < TOTAL_MAX_ATTEMPTS:
-                    fallback = self._next_healthy_model(exclude=tried_models)
-                    if fallback:
-                        logger.info("التبديل إلى نموذج بديل صحي: %s", fallback)
-                        tried_models.append(fallback)
-                        model = fallback
-                        working_messages = None
-                        continue
+                fallback = self._next_healthy_model(exclude=tried_models)
+                if fallback and len(tried_models) <= settings.MAX_FALLBACK_MODELS:
+                    logger.info("التبديل إلى نموذج بديل صحي: %s", fallback)
+                    tried_models.append(fallback)
+                    model = fallback
+                    working_messages = None
+                    attempts -= 1  # التبديل بسبب عطل تقني لا يُحتسب من محاولات المحتوى
+                    continue
                 return "تعذر الوصول إلى أي نموذج متاح حالياً، حاول لاحقاً.", [], "stop"
 
             message = resp.choices[0].message
@@ -147,19 +142,18 @@ class AgentRunner:
                 # أدوات يديرها العميل → إرجاعها بصيغة OpenAI
                 return content, [c.to_openai() for c in valid_calls], "tool_calls"
 
-            # 2) وعد فارغ؟ → إعادة محاولة ضمن نفس عداد المحاولات الموحد (لا عداد إضافي منفصل)
-            if is_hedging(content) and attempts < TOTAL_MAX_ATTEMPTS:
+            # 2) وعد فارغ؟ → إعادة محاولة واحدة فقط (عداد منفصل عن الفشل التقني) مع تذكير حاد
+            if is_hedging(content) and hedge_attempts < settings.MAX_HEDGE_RETRIES:
                 logger.warning("رُصد وعد فارغ، إعادة المحاولة بتذكير حاد")
+                hedge_attempts += 1
                 strict = True
-                # نحافظ على working_messages إن وُجدت نتائج أدوات سابقة بدل تصفيرها بالكامل،
-                # فقط نضيف تذكيراً حاداً جديداً في نهاية السياق الحالي.
                 working_messages = (working_messages or messages) + [
                     {"role": "system", "content": build_agent_reminder(request.tools or [], strict=True)}
                 ]
                 continue
 
             # 3) رد نهائي → كسر الحلقة
-            if is_final(content) or attempts >= TOTAL_MAX_ATTEMPTS:
+            if is_final(content) or attempts >= settings.MAX_TOOL_RETRIES:
                 return content, [], "stop"
 
             strict = True
