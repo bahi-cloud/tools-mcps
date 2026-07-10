@@ -5,6 +5,11 @@
 ينفذها فعلياً على الخادم (كل الأدوات كانت تُعاد للعميل عبر finish_reason="tool_calls"
 حتى لو كانت أدوات بسيطة يفترض أن يديرها الخادم نفسه، مثل الوقت الحالي أو حاسبة).
 
+الآن: أضفنا أداة عامة واحدة (call_tool) تنفذ أي أداة عبر الباك اند الخارجي
+(https://ayb-bh92-tools.hf.space/call)، مما يغطي جميع الأدوات الأساسية (27 أداة)
+وجميع أدوات الفيديو/الصوت (100+ أداة) وجميع أدوات Composio، دون الحاجة لتسجيل
+كل أداة على حدة.
+
 طريقة الاستخدام:
 1) عرّف دالة async(arguments: dict) -> str لكل أداة.
 2) سجّلها عبر register_tool("اسم_الأداة", الدالة).
@@ -14,19 +19,18 @@
 import datetime
 import json
 import logging
-import aiohttp  # ← إضافة جديدة
+import aiohttp
 
 from services.agent_loop import register_tool
 
 logger = logging.getLogger("gateway.tools.executor")
 
-
+# ===== الأدوات الأساسية (تعمل محلياً) =====
 async def _get_current_datetime(arguments: dict) -> str:
     """مثال أداة حقيقية بسيطة: الوقت والتاريخ الحاليان (بدون اتصال خارجي)."""
     tz = arguments.get("timezone", "UTC")
     now = datetime.datetime.now(datetime.timezone.utc)
     return json.dumps({"utc_datetime": now.isoformat(), "requested_timezone": tz}, ensure_ascii=False)
-
 
 async def _calculator(arguments: dict) -> str:
     """
@@ -58,7 +62,6 @@ async def _calculator(arguments: dict) -> str:
     except Exception as exc:
         return json.dumps({"error": f"تعذر حساب '{expr}': {exc}"}, ensure_ascii=False)
 
-
 async def _web_search_placeholder(arguments: dict) -> str:
     """
     قالب جاهز لربط بحث ويب حقيقي (SerpAPI / Tavily / Brave Search API إلخ).
@@ -70,66 +73,91 @@ async def _web_search_placeholder(arguments: dict) -> str:
                  "(مثل Tavily أو SerpAPI) في core/config.py ونفّذ الاستدعاء الفعلي هنا."
     }, ensure_ascii=False)
 
+# ===== الأداة العامة للاتصال بجميع أدوات الباك اند =====
+async def _call_any_tool(arguments: dict) -> str:
+    """
+    ★ الأداة الشاملة ★
+    تنفذ أي أداة عبر الباك اند الخارجي (https://ayb-bh92-tools.hf.space/call).
+    تغطي هذه الأداة جميع أدوات الباك اند:
+    - أدوات البحث والتصفح (Firecrawl)
+    - أدوات التوثيق (Context7)
+    - أدوات Composio (Gmail, Slack, GitHub, إلخ)
+    - أدوات المستندات (PDF, DOCX, PPTX, XLSX)
+    - أدوات الفيديو/الصوت (أكثر من 100 أداة)
+    - وأي أداة جديدة تُضاف للباك اند مستقبلاً.
 
-# ===== الأدوات الجديدة =====
-async def _create_pdf(arguments: dict) -> str:
-    """تنفيذ أداة create_pdf عبر الاتصال بـ API الخادم."""
-    url = "https://ayb-bh92-tools.hf.space/call"
-    payload = {
-        "tool": "create_pdf",
-        "arguments": {
-            "title": arguments.get("title", ""),
-            "content_markdown": arguments.get("content_markdown", arguments.get("content", ""))
+    المتطلبات:
+        arguments: {
+            "tool": "اسم_الأداة_في_الباك_اند",  # مثل create_pdf, cut_video, composio_execute_tool
+            "arguments": { ... }  # وسائط الأداة المطلوبة
         }
-    }
     
+    مثال:
+        {
+            "tool": "create_pdf",
+            "arguments": {
+                "title": "الذكاء الاصطناعي",
+                "content_markdown": "# مقدمة ..."
+            }
+        }
+    """
+    url = "https://ayb-bh92-tools.hf.space/call"
+    tool_name = arguments.get("tool")
+    tool_args = arguments.get("arguments", {})
+
+    if not tool_name:
+        return json.dumps({"error": "الحقل 'tool' مطلوب في الوسائط"}, ensure_ascii=False)
+
+    payload = {"tool": tool_name, "arguments": tool_args}
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload) as response:
                 if response.status == 200:
                     data = await response.json()
                     if data.get("ok"):
-                        file_url = data["result"]["file_url"]
-                        return json.dumps({"status": "success", "file_url": file_url}, ensure_ascii=False)
+                        # إرجاع النتيجة مع ترجمة المفاتيح لتكون واضحة للوكيل
+                        result = data.get("result", {})
+                        if isinstance(result, dict) and "file_url" in result:
+                            # إذا كانت النتيجة تحتوي على رابط ملف، نعطي رسالة واضحة
+                            return json.dumps({
+                                "status": "success",
+                                "file_url": result["file_url"],
+                                "message": f"تم تنفيذ {tool_name} بنجاح. رابط الملف: {result['file_url']}"
+                            }, ensure_ascii=False)
+                        return json.dumps({
+                            "status": "success",
+                            "result": result
+                        }, ensure_ascii=False)
                     else:
-                        return json.dumps({"error": data.get("error", "فشل إنشاء PDF")}, ensure_ascii=False)
+                        return json.dumps({
+                            "status": "error",
+                            "error": data.get("error", f"فشل تنفيذ الأداة {tool_name}")
+                        }, ensure_ascii=False)
                 else:
-                    return json.dumps({"error": f"خطأ في الاتصال: {response.status}"}, ensure_ascii=False)
+                    return json.dumps({
+                        "status": "error",
+                        "error": f"خطأ في الاتصال بالباك اند: {response.status}"
+                    }, ensure_ascii=False)
+    except aiohttp.ClientError as e:
+        return json.dumps({
+            "status": "error",
+            "error": f"خطأ في الشبكة: {str(e)}"
+        }, ensure_ascii=False)
     except Exception as e:
-        return json.dumps({"error": f"استثناء: {str(e)}"}, ensure_ascii=False)
+        return json.dumps({
+            "status": "error",
+            "error": f"استثناء غير متوقع: {str(e)}"
+        }, ensure_ascii=False)
 
-
-async def _create_xlsx(arguments: dict) -> str:
-    """تنفيذ أداة create_xlsx عبر الاتصال بـ API الخادم."""
-    url = "https://ayb-bh92-tools.hf.space/call"
-    payload = {
-        "tool": "create_xlsx",
-        "arguments": {
-            "title": arguments.get("title", "document")
-        }
-    }
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get("ok"):
-                        file_url = data["result"]["file_url"]
-                        return json.dumps({"status": "success", "file_url": file_url}, ensure_ascii=False)
-                    else:
-                        return json.dumps({"error": data.get("error", "فشل إنشاء Excel")}, ensure_ascii=False)
-                else:
-                    return json.dumps({"error": f"خطأ في الاتصال: {response.status}"}, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": f"استثناء: {str(e)}"}, ensure_ascii=False)
-
-
-# --- التسجيل الفعلي في SERVER_TOOLS (يجعل هذه الأدوات تُنفَّذ على الخادم مباشرة) ---
+# ===== تسجيل الأدوات في SERVER_TOOLS =====
+# الأدوات الأساسية (تعمل محلياً)
 register_tool("get_current_datetime", _get_current_datetime)
 register_tool("calculate", _calculator)
 register_tool("web_search", _web_search_placeholder)
-register_tool("create_pdf", _create_pdf)      # ← إضافة جديدة
-register_tool("create_xlsx", _create_xlsx)    # ← إضافة جديدة
 
-logger.info("تم تسجيل أدوات الخادم: get_current_datetime, calculate, web_search(placeholder), create_pdf, create_xlsx")
+# ★ الأداة الشاملة (تغطي جميع أدوات الباك اند) ★
+register_tool("call_tool", _call_any_tool)
+
+logger.info("✅ تم تسجيل أدوات الخادم: get_current_datetime, calculate, web_search(placeholder), call_tool (للتعامل مع جميع أدوات الباك اند)")
+logger.info("✅ أداة call_tool تغطي أكثر من 120 أداة في الباك اند (بما فيها الفيديو و Composio)")
