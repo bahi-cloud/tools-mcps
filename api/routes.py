@@ -1,6 +1,6 @@
 """
 نقاط النهاية المتوافقة مع OpenAI API.
-الإصدار الذكي: يقرر متى يتدفق ومتى يعمل كوكيل.
+الإصدار الذكي: يفهم نية المستخدم ولا يتأخر عند التحية.
 """
 import json
 import logging
@@ -28,39 +28,39 @@ router = APIRouter(prefix="/v1", dependencies=[Depends(verify_api_key)])
 client = AsyncClient()
 runner = AgentRunner(client)
 
-# الكلمات المفتاحية التي تشير إلى طلب استخدام أداة
-_TOOL_KEYWORDS = re.compile(
-    r"(أنشئ|اقطع|حوّل|استخرج|دمج|أضف|احذف|غيّر|PDF|فيديو|صوت|مستند|word|excel|ppt|ترجمة|تعديل|قص)",
-    re.IGNORECASE
-)
-
-# النماذج التي تدعم الأدوات بشكل طبيعي
-_TOOL_SUPPORTED_MODELS = {"deepseek-r1", "gpt-4o", "command-a", "command-r"}
-
 
 def _should_use_agent_mode(request: ChatCompletionRequest) -> bool:
     """
-    قرار ذكي: هل يجب أن نستخدم حلقة الوكيل (وضع عدم التدفق) أم لا؟
-
-    المعايير:
-    1. وجود أدوات في الطلب.
-    2. طلب صريح من المستخدم (تحليل النصوص).
-    3. النموذج المستخدم يدعم الأدوات.
+    قرار ذكي: تفعيل وضع الوكيل فقط عند طلب صريح لإنشاء أو تعديل ملف.
     """
-    # 1. أدوات في الطلب
+    # 1. وجود أدوات في الطلب (ثقة عالية)
     if request.tools:
         return True
 
-    # 2. طلب صريح من المستخدم
-    user_text = " ".join([m.content for m in request.messages if m.role == "user"])
-    if _TOOL_KEYWORDS.search(user_text):
-        return True
+    # 2. تحليل نية المستخدم من النص
+    user_text = " ".join([m.content for m in request.messages if m.role == "user"]).lower()
 
-    # 3. النموذج يدعم الأدوات
-    if request.model in _TOOL_SUPPORTED_MODELS:
-        return True
+    # أنماط لإنشاء/تعديل ملفات محددة
+    creation_patterns = [
+        r"أنشئ\s*(لي\s*)?(pdf|ملف\s*pdf|اكسل|word|ppt|فيديو|صوت|مستند)",
+        r"(pdf|اكسل|word|ppt|فيديو|صوت|مستند)\s*(جديد|ملف)",
+        r"حوّل\s*(الصورة|الفيديو|الصوت|المستند)",
+        r"اقطع\s*(فيديو|صوت|مقطع)",
+        r"دمج\s*(فيديو|صوت|ملفات)",
+        r"استخرج\s*(الصوت|النص|الفيديو)",
+        r"تعديل\s*(pdf|اكسل|word|فيديو|صوت)",
+    ]
 
-    # افتراضياً: لا نستخدم وضع الوكيل (تدفق عادي)
+    for pattern in creation_patterns:
+        if re.search(pattern, user_text):
+            return True
+
+    # 3. إذا كانت الكلمات المفتاحية عامة دون طلب إنشاء، لا نفعّل الوكيل
+    general_keywords = ["مرحباً", "كيف", "ما هو", "أخبرني", "اشرح"]
+    if any(kw in user_text for kw in general_keywords):
+        return False
+
+    # 4. افتراضياً: لا نستخدم وضع الوكيل (تدفق عادي)
     return False
 
 
@@ -90,7 +90,6 @@ async def chat_completions(request: ChatCompletionRequest):
             }
         )
 
-    # وضع غير تدفقي (يعمل مع الأدوات)
     content, tool_calls, finish_reason = await runner.run(request)
 
     message = ChatMessage(role="assistant", content=content or None)
@@ -110,9 +109,9 @@ async def _stream(request: ChatCompletionRequest, model: str):
     """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     try:
-        # ✅ القرار الذكي: هل نستخدم وضع الوكيل؟
+        # ✅ القرار الذكي: تفعيل الوكيل فقط عند طلب إنشاء ملف
         if _should_use_agent_mode(request):
-            logger.info("🧠 الوكيل في وضع Agent (التدفق معطل)")
+            logger.info("🧠 الوكيل في وضع Agent (طلب إنشاء ملف)")
             content, tool_calls, finish_reason = await runner.run(request)
 
             delta = DeltaMessage(role="assistant", content=content)
@@ -135,8 +134,8 @@ async def _stream(request: ChatCompletionRequest, model: str):
             yield "data: [DONE]\n\n"
             return
 
-        # ✅ وضع النموذج العادي (تدفق حقيقي)
-        logger.info("📝 الوكيل في وضع Chat (التدفق مفعل)")
+        # ✅ وضع المحادثة العادية (تدفق حقيقي)
+        logger.info("📝 الوكيل في وضع Chat (محادثة عادية)")
         messages = runner._prepare_messages(request, strict=False)
         stream = client.chat.completions.stream(model=model, messages=messages)
 
