@@ -17,10 +17,15 @@ from models.openai_schemas import (
 from services.agent_loop import AgentRunner
 from services.model_registry import registry
 
+# تسجيل أدوات الخادم مرة واحدة عند تحميل الوحدة (يكفي الاستيراد لتفعيل register_tool داخله)
+from services import tool_executor  # noqa: F401
+
 logger = logging.getLogger("gateway.api")
 router = APIRouter(prefix="/v1", dependencies=[Depends(verify_api_key)])
 client = AsyncClient()
 runner = AgentRunner(client)
+
+_STREAM_CHUNK_SIZE = 40  # عدد الأحرف تقريباً في كل جزء عند محاكاة التدفق لناتج الوكيل
 
 
 @router.get("/models")
@@ -52,10 +57,66 @@ async def chat_completions(request: ChatCompletionRequest):
     )
 
 
+def _chunk_text(text: str, size: int = _STREAM_CHUNK_SIZE):
+    """يقسّم نصاً جاهزاً إلى أجزاء صغيرة لمحاكاة تدفق SSE بعد أن أنهت حلقة الوكيل عملها كاملة."""
+    for i in range(0, len(text), size):
+        yield text[i:i + size]
+
+
 async def _stream(request: ChatCompletionRequest, model: str):
-    """مولّد SSE متوافق مع OpenAI (data: {...}\\n\\n ثم [DONE])."""
+    """
+    مولّد SSE متوافق مع OpenAI (data: {...}\\n\\n ثم [DONE]).
+
+    === الإصلاح الجوهري ===
+    النسخة السابقة كانت تُمرر الطلب مباشرة إلى client.chat.completions.stream()
+    بغض النظر عن وجود tools، أي أن كل منطق الوكيل (كشف الاستدعاءات، البروتوكول
+    الصارم، التبديل التلقائي) كان يُتجاوز بالكامل في وضع stream=True.
+
+    السبب التقني لعدم إمكان تفعيل الوكيل أثناء التدفق الحقيقي حرفياً حرفاً:
+    قرار "هل هذا استدعاء أداة صالح؟" يحتاج الرد كاملاً (JSON غير مكتمل لا يمكن
+    تحليله وسط التدفق). لذلك عند وجود tools في الطلب، نُشغّل حلقة الوكيل الكاملة
+    داخلياً حتى تنتهي، ثم "نحاكي" التدفق للعميل بإرسال النتيجة على دفعات — هذا
+    يحافظ على واجهة SSE المتوقعة من العميل بينما يضمن صحة قرار استدعاء الأداة.
+
+    عندما لا توجد tools في الطلب (محادثة عادية)، يبقى التدفق حقيقياً وحرفاً بحرف
+    كما كان، لأنه لا داعي لأي تحليل بنيوي في هذه الحالة.
+    """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     try:
+        if request.tools and settings.STREAM_USES_AGENT_LOOP:
+            content, tool_calls, finish_reason = await runner.run(request)
+
+            if tool_calls:
+                chunk = ChatCompletionChunk(
+                    id=chunk_id, model=model,
+                    choices=[StreamChoice(delta=DeltaMessage(role="assistant", tool_calls=tool_calls))],
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
+                final = ChatCompletionChunk(
+                    id=chunk_id, model=model,
+                    choices=[StreamChoice(delta=DeltaMessage(), finish_reason="tool_calls")],
+                )
+                yield f"data: {final.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            first = True
+            for piece in _chunk_text(content or ""):
+                chunk = ChatCompletionChunk(
+                    id=chunk_id, model=model,
+                    choices=[StreamChoice(delta=DeltaMessage(role="assistant" if first else None, content=piece))],
+                )
+                first = False
+                yield f"data: {chunk.model_dump_json()}\n\n"
+            final = ChatCompletionChunk(
+                id=chunk_id, model=model,
+                choices=[StreamChoice(delta=DeltaMessage(), finish_reason=finish_reason or "stop")],
+            )
+            yield f"data: {final.model_dump_json()}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # لا أدوات في الطلب → تدفق حقيقي مباشر (السلوك الأصلي، محادثة عادية فقط)
         messages = runner._prepare_messages(request, strict=False)
         stream = client.chat.completions.stream(model=model, messages=messages)
         first = True
