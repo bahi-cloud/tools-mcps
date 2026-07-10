@@ -14,6 +14,7 @@
 import datetime
 import json
 import logging
+import aiohttp  # ← إضافة جديدة
 
 from services.agent_loop import register_tool
 
@@ -70,9 +71,65 @@ async def _web_search_placeholder(arguments: dict) -> str:
     }, ensure_ascii=False)
 
 
+# ===== الأدوات الجديدة =====
+async def _create_pdf(arguments: dict) -> str:
+    """تنفيذ أداة create_pdf عبر الاتصال بـ API الخادم."""
+    url = "https://ayb-bh92-tools.hf.space/call"
+    payload = {
+        "tool": "create_pdf",
+        "arguments": {
+            "title": arguments.get("title", ""),
+            "content_markdown": arguments.get("content_markdown", arguments.get("content", ""))
+        }
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("ok"):
+                        file_url = data["result"]["file_url"]
+                        return json.dumps({"status": "success", "file_url": file_url}, ensure_ascii=False)
+                    else:
+                        return json.dumps({"error": data.get("error", "فشل إنشاء PDF")}, ensure_ascii=False)
+                else:
+                    return json.dumps({"error": f"خطأ في الاتصال: {response.status}"}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"استثناء: {str(e)}"}, ensure_ascii=False)
+
+
+async def _create_xlsx(arguments: dict) -> str:
+    """تنفيذ أداة create_xlsx عبر الاتصال بـ API الخادم."""
+    url = "https://ayb-bh92-tools.hf.space/call"
+    payload = {
+        "tool": "create_xlsx",
+        "arguments": {
+            "title": arguments.get("title", "document")
+        }
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("ok"):
+                        file_url = data["result"]["file_url"]
+                        return json.dumps({"status": "success", "file_url": file_url}, ensure_ascii=False)
+                    else:
+                        return json.dumps({"error": data.get("error", "فشل إنشاء Excel")}, ensure_ascii=False)
+                else:
+                    return json.dumps({"error": f"خطأ في الاتصال: {response.status}"}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"استثناء: {str(e)}"}, ensure_ascii=False)
+
+
 # --- التسجيل الفعلي في SERVER_TOOLS (يجعل هذه الأدوات تُنفَّذ على الخادم مباشرة) ---
 register_tool("get_current_datetime", _get_current_datetime)
 register_tool("calculate", _calculator)
 register_tool("web_search", _web_search_placeholder)
+register_tool("create_pdf", _create_pdf)      # ← إضافة جديدة
+register_tool("create_xlsx", _create_xlsx)    # ← إضافة جديدة
 
-logger.info("تم تسجيل أدوات الخادم: get_current_datetime, calculate, web_search(placeholder)")
+logger.info("تم تسجيل أدوات الخادم: get_current_datetime, calculate, web_search(placeholder), create_pdf, create_xlsx")
