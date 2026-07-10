@@ -3,9 +3,7 @@
 """
 import json
 import logging
-import time
 import uuid
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -71,19 +69,18 @@ async def chat_completions(request: ChatCompletionRequest):
 async def _stream(request: ChatCompletionRequest, model: str):
     """
     مولّد SSE متوافق مع OpenAI (data: {...}\\n\\n ثم [DONE]).
-    ✅ الإصدار القديم مع إصلاح بسيط لتفادي خطأ tool_calls.
+    ✅ يعمل مع الأدوات عبر AgentRunner في وضع التدفق.
     """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     try:
-        # ✅ الإصلاح: استخدام AgentRunner للحصول على الرد (غير تدفقي)
+        # ✅ استخدام AgentRunner للحصول على الرد (مع الأدوات)
         content, tool_calls, finish_reason = await runner.run(request)
 
-        # بناء الـ DeltaMessage دون استخدام tool_calls (لتجنب الخطأ)
+        # بناء الـ DeltaMessage
         delta = DeltaMessage(role="assistant", content=content)
-        
-        # ✅ إذا كانت هناك tool_calls، نرسلها كجزء من الـ content (حل مؤقت)
+
+        # ✅ إذا كانت هناك tool_calls، نحولها إلى نص JSON ونضيفها للمحتوى
         if tool_calls:
-            # تحويل tool_calls إلى نص JSON وإضافته للمحتوى
             tool_calls_text = json.dumps(tool_calls, ensure_ascii=False)
             delta.content = f"{content}\n\n[TOOL_CALLS]: {tool_calls_text}"
 
