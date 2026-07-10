@@ -1,4 +1,4 @@
-"""حلقة التنفيذ الذكية: محاولات محدودة، كشف الوعود الفارغة، تنفيذ الأدوات."""
+"""حلقة التنفيذ الذكية: محاولات محدودة، بروتوكول JSON صارم، تنفيذ الأدوات، وتبديل تلقائي للنموذج."""
 import asyncio
 import json
 import logging
@@ -9,11 +9,12 @@ from g4f.client import AsyncClient
 from core.config import settings
 from models.openai_schemas import ChatCompletionRequest, ToolDef
 from services.prompts import build_agent_directive, build_agent_reminder
-from services.tool_processor import normalize_tool_calls, validate_call
+from services.tool_processor import normalize_tool_calls, validate_call, extract_final_answer
 
 logger = logging.getLogger("gateway.agent")
 
-# أفعال مستقبلية تدل على وعد فارغ (عربي/إنجليزي)
+# --- الإبقاء على heuristics القديمة كـ fallback فقط (عندما STRICT_JSON_PROTOCOL=False
+#     أو عندما لا توجد tools في الطلب أصلاً، أي محادثة عادية بلا وكيل) ---
 _HEDGING = re.compile(
     r"(سأقوم|سأفعل|سأتحقق|سأبحث|سوف أ|دعني|لحظة من فضلك|i will|i'll|let me|going to|one moment)",
     re.IGNORECASE,
@@ -25,18 +26,35 @@ ToolExecutor = Callable[[dict], Awaitable[str]]
 SERVER_TOOLS: dict[str, ToolExecutor] = {}
 
 
+def register_tool(name: str, executor: ToolExecutor) -> None:
+    """نقطة تسجيل موحّدة لأدوات الخادم (استخدمها من services/tool_executor.py)."""
+    SERVER_TOOLS[name] = executor
+
+
 def is_hedging(text: str) -> bool:
-    """رد قصير (< 250 حرفاً) يحتوي أفعالاً مستقبلية → وعد فارغ."""
+    """[fallback فقط] رد قصير (< 250 حرفاً) يحتوي أفعالاً مستقبلية → وعد فارغ."""
     return len(text.strip()) < 250 and bool(_HEDGING.search(text))
 
 
 def is_final(text: str) -> bool:
-    """رد نهائي: نص طويل أو يحتوي كلمات ختامية."""
+    """[fallback فقط] رد نهائي: نص طويل أو يحتوي كلمات ختامية."""
     return len(text.strip()) >= 250 or bool(_FINAL_MARKERS.search(text))
 
 
+_STRICT_ENVELOPE_NOTICE = {
+    "role": "system",
+    "content": (
+        "تعليمة إلزامية بخصوص صيغة الرد: إذا لم تكن بحاجة لاستدعاء أي أداة، "
+        'فيجب أن يكون ردك بالكامل عبارة عن JSON صالح وفقط لا غير، بالشكل: '
+        '{"final": "نص إجابتك الكامل هنا"}. '
+        "لا تكتب أي نص خارج هذا الكائن. لا تستخدم علامات ```. "
+        "أي رد لا يطابق هذه الصيغة ولا يحتوي استدعاء أداة صالح سيُرفض وتُطلب منك إعادة الصياغة."
+    ),
+}
+
+
 class AgentRunner:
-    """يدير حلقة while مع عداد محاولات وتوجيه مزدوج."""
+    """يدير حلقة while مع ميزانيتي محاولات منفصلتين (أدوات / تنسيق) وتبديل تلقائي للنموذج."""
 
     def __init__(self, client: AsyncClient):
         self.client = client
@@ -50,26 +68,72 @@ class AgentRunner:
             if not any(m["role"] == "system" and "القواعد الذهبية" in (m.get("content") or "") for m in msgs):
                 msgs.insert(0, {"role": "system", "content": directive})
             msgs.append({"role": "system", "content": build_agent_reminder(tools, strict=strict)})
+            if settings.STRICT_JSON_PROTOCOL:
+                msgs.append(_STRICT_ENVELOPE_NOTICE)
         return msgs
+
+    def _next_healthy_model(self, current: str, excluded: list[str]) -> Optional[str]:
+        """يختار نموذجاً بديلاً سليماً من السجل عند فشل النموذج الحالي (Failover)."""
+        try:
+            from services.model_registry import registry  # استيراد مؤجل لتفادي أي حلقة استيراد
+            candidates = [m for m in registry.healthy_models() if m not in excluded and m != current]
+        except Exception:
+            logger.debug("تعذر الوصول لسجل النماذج من أجل التبديل التلقائي", exc_info=True)
+            return None
+        return candidates[0] if candidates else None
+
+    async def _call_model(self, model: str, messages: list[dict], request: ChatCompletionRequest):
+        """
+        استدعاء فعلي للمزوّد.
+
+        === الإصلاح الجوهري ===
+        النسخة السابقة كانت تستدعي create(model=model, messages=messages) بدون tools=
+        أو tool_choice=، مما يعني أن النموذج لم يكن يُخطر رسمياً بوجود أي أداة على الإطلاق
+        (الاعتماد كان فقط على حقن نص التوجيه، وهذا ما كان يجعل السلوك أقرب لمحادثة عادية).
+        """
+        return await asyncio.wait_for(
+            self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=request.tools or None,
+                tool_choice=getattr(request, "tool_choice", None) or ("auto" if request.tools else None),
+            ),
+            timeout=settings.REQUEST_TIMEOUT,
+        )
 
     async def run(self, request: ChatCompletionRequest) -> tuple[str, list, str]:
         """
         حلقة التنفيذ. تُرجع (المحتوى النهائي, استدعاءات أدوات للعميل, finish_reason).
         """
         model = request.model or settings.DEFAULT_MODEL
-        attempts = 0
+        tool_attempts = 0     # عدد جولات استدعاء الأدوات الناجحة/المقبولة
+        format_attempts = 0   # عدد محاولات إصلاح رد مشوّه/غير مكتمل
         strict = False
         working_messages: Optional[list[dict]] = None
+        failed_models: list[str] = []
+        content = ""
 
-        while attempts < settings.MAX_TOOL_RETRIES:
-            attempts += 1
+        while tool_attempts < settings.MAX_TOOL_ITERATIONS and format_attempts < settings.MAX_FORMAT_RETRIES:
             messages = working_messages or self._prepare_messages(request, strict)
-            logger.info("محاولة %d/%d على النموذج %s", attempts, settings.MAX_TOOL_RETRIES, model)
-
-            resp = await asyncio.wait_for(
-                self.client.chat.completions.create(model=model, messages=messages),
-                timeout=settings.REQUEST_TIMEOUT,
+            logger.info(
+                "محاولة (أدوات %d/%d، تنسيق %d/%d) على النموذج %s",
+                tool_attempts, settings.MAX_TOOL_ITERATIONS,
+                format_attempts, settings.MAX_FORMAT_RETRIES, model,
             )
+
+            # --- تبديل تلقائي للنموذج عند فشل المزوّد (بدل فشل الطلب بالكامل) ---
+            try:
+                resp = await self._call_model(model, messages, request)
+            except Exception as exc:
+                logger.warning("فشل الاستدعاء على النموذج '%s': %s", model, exc)
+                failed_models.append(model)
+                fallback = self._next_healthy_model(model, failed_models)
+                if fallback:
+                    logger.info("تبديل تلقائي إلى نموذج بديل سليم: %s", fallback)
+                    model = fallback
+                    continue
+                raise
+
             message = resp.choices[0].message
             content = message.content or ""
 
@@ -82,6 +146,7 @@ class AgentRunner:
                 logger.warning("استدعاء مرفوض '%s': %s", bad.name, bad.rejection_reason)
 
             if valid_calls:
+                tool_attempts += 1
                 server_side = [c for c in valid_calls if c.name in SERVER_TOOLS]
                 if server_side:
                     # تنفيذ على الخادم وإضافة النتائج إلى السياق ثم الاستمرار
@@ -101,18 +166,41 @@ class AgentRunner:
                 # أدوات يديرها العميل → إرجاعها بصيغة OpenAI
                 return content, [c.to_openai() for c in valid_calls], "tool_calls"
 
-            # 2) وعد فارغ؟ → إعادة محاولة مع تذكير حاد
-            if is_hedging(content) and attempts < settings.MAX_TOOL_RETRIES:
-                logger.warning("رُصد وعد فارغ، إعادة المحاولة بتذكير حاد")
+            # 2) لا استدعاءات صالحة، لكن هناك استدعاءات مرفوضة → أعطِ النموذج فرصة تصحيح نفسه
+            if invalid_calls:
+                format_attempts += 1
+                if format_attempts >= settings.MAX_FORMAT_RETRIES:
+                    return content, [], "stop"
+                reasons = "; ".join(f"{c.name}: {c.rejection_reason}" for c in invalid_calls)
+                working_messages = messages + [
+                    {"role": "assistant", "content": content},
+                    {"role": "system", "content": f"استدعاء الأداة السابق مرفوض: {reasons}. صحّح الاستدعاء أو أرجع {{\"final\": ...}}."},
+                ]
+                strict = True
+                continue
+
+            # 3) بروتوكول JSON الصارم (الافتراضي): يبحث عن {"final": "..."} صراحة
+            if settings.STRICT_JSON_PROTOCOL and request.tools:
+                final_text = extract_final_answer(content)
+                if final_text is not None:
+                    return final_text, [], "stop"
+                # لا استدعاء أداة، ولا {"final": ...} صريح → رد غير مطابق للصيغة، أعد المحاولة
+                format_attempts += 1
+                if format_attempts >= settings.MAX_FORMAT_RETRIES:
+                    # استنفدنا الميزانية: أرجع المحتوى الخام بدل تعليق الطلب إلى الأبد
+                    return content, [], "stop"
                 strict = True
                 working_messages = None
                 continue
 
-            # 3) رد نهائي → كسر الحلقة
-            if is_final(content) or attempts >= settings.MAX_TOOL_RETRIES:
-                return content, [], "stop"
+            # 4) مسار fallback القديم (فقط عند تعطيل STRICT_JSON_PROTOCOL أو عدم وجود tools)
+            if is_hedging(content) and format_attempts < settings.MAX_FORMAT_RETRIES:
+                format_attempts += 1
+                logger.warning("رُصد وعد فارغ (heuristic)، إعادة المحاولة بتذكير حاد")
+                strict = True
+                working_messages = None
+                continue
 
-            strict = True
-            working_messages = None
+            return content, [], "stop"
 
         return content, [], "stop"
