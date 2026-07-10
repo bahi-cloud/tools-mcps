@@ -1,34 +1,24 @@
 FROM python:3.11-slim
 
-# معلومات المطور
-LABEL maintainer="YourName"
-LABEL description="G4F API Server - Free AI Chat"
+# مستخدم غير جذري (مطلوب في HF Spaces)
+RUN useradd -m -u 1000 user
+USER user
+ENV PATH="/home/user/.local/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/user
 
-# إعداد بيئة العمل
-WORKDIR /app
+WORKDIR /home/user/app
 
-# تحديث النظام وتثبيت المتطلبات
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+# تثبيت الاعتماديات أولاً للاستفادة من طبقات الكاش
+COPY --chown=user requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
 
-# نسخ المتطلبات أولاً (لتسريع البناء)
-COPY requirements.txt .
+# نسخ كود المشروع
+COPY --chown=user . .
 
-# تثبيت المكتبات
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+# مسار اللقطة في مجلد قابل للكتابة
+ENV SNAPSHOT_PATH=/home/user/app/active_models.json
 
-# نسخ الكود
-COPY . .
-
-# المنفذ
 EXPOSE 7860
 
-# فحص الصحة
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
-
-# تشغيل التطبيق
-CMD ["python", "app.py"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
