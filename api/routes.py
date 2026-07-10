@@ -31,36 +31,57 @@ runner = AgentRunner(client)
 
 def _should_use_agent_mode(request: ChatCompletionRequest) -> bool:
     """
-    قرار ذكي: تفعيل وضع الوكيل فقط عند طلب صريح لإنشاء أو تعديل ملف.
+    قرار ذكي ومحسن جداً: يحدد بدقة متناهية متى يتم الانتقال لوضع الوكيل (Agent Mode)
+    ومتى يتم الإبقاء على وضع المحادثة المتدفقة العادية (Chat Mode).
     """
-    # 1. وجود أدوات في الطلب (ثقة عالية)
-    if request.tools:
+    # 1. إذا قام العميل بتمرير أدوات صريحة في مصفوفة الأدوات أو حقول الـ functions (أعلى درجات الثقة)
+    if request.tools or getattr(request, 'functions', None):
         return True
 
-    # 2. تحليل نية المستخدم من النص
-    user_text = " ".join([m.content for m in request.messages if m.role == "user"]).lower()
+    # 2. استخراج وتجميع النص الكامل لرسائل المستخدم الأخيرة لتحليل النية بدقة
+    user_messages = [m.content for m in request.messages if m.role == "user" and m.content]
+    if not user_messages:
+        return False
+        
+    user_text = " ".join(user_messages).lower().strip()
 
-    # أنماط لإنشاء/تعديل ملفات محددة
-    creation_patterns = [
-        r"أنشئ\s*(لي\s*)?(pdf|ملف\s*pdf|اكسل|word|ppt|فيديو|صوت|مستند)",
-        r"(pdf|اكسل|word|ppt|فيديو|صوت|مستند)\s*(جديد|ملف)",
-        r"حوّل\s*(الصورة|الفيديو|الصوت|المستند)",
-        r"اقطع\s*(فيديو|صوت|مقطع)",
-        r"دمج\s*(فيديو|صوت|ملفات)",
-        r"استخرج\s*(الصوت|النص|الفيديو)",
-        r"تعديل\s*(pdf|اكسل|word|فيديو|صوت)",
+    # 3. الفحص الاستباقي: إذا كانت الرسالة مجرد تحية قصيرة جداً أو سؤال عام واشتقاقي، لا نفعّل الوكيل مطلقاً
+    if len(user_text.split()) <= 3:
+        fast_chat_keywords = ["مرحباً", "مرحبا", "سلام", "هلا", "hi", "hello", "hey", "صباح", "مساء"]
+        if any(user_text.startswith(kw) or user_text.endswith(kw) for kw in fast_chat_keywords):
+            return False
+
+    # 4. ترسانة الأنماط الذكية لتغطية جميع أدوات الباك اند الـ 120+ (ملفات، ميديا، أتمتة، بحث)
+    agent_intent_patterns = [
+        # أدوات المستندات والملفات والترجمة
+        r"(أنشئ|اعمل|صمم|اكتب|سوي|صنع|تعديل|تغيير|تحويل)\s*(لي\s*)?(pdf|ملف|اكسل|word|xlsx|docx|pptx|ppt|مستند|جدول|عرض)",
+        r"(اقرأ|استخرج|بيانات|محتوى|معلومات)\s*(من\s*)?(pdf|ملف|مستند|اكسل)",
+        r"markdown\s*to\s*html|تحويل\s*ماركداون",
+        
+        # أدوات الفيديو، الميديا، الصلاحيات، والصوتيات
+        r"(اقطع|قص|دمج|تجميع|تركيب|تعديل|تحويل|تغيير)\s*(مقطع|فيديو|صوت|أغنية|ترجمة|subtitle|srt)",
+        r"(استخراج|فصل)\s*(الصوت|الموسيقى|النص)\s*(من\s*)?(الفيديو)",
+        r"(تسريع|تبطيء|سرعة|حذف\s*الصمت|صمت)\s*(الفيديو|الصوت)",
+        r"(إضافة|وضع|حرق)\s*(نص|كتابة|شعار|صورة|ووترمارك|لوجو)\s*(على|فوق)\s*(الفيديو)",
+        r"b-roll|b\s*roll|انتقالات\s*فيديو",
+        
+        # أدوات البحث المتقدم والتصفح (Firecrawl) والتوثيق (Context7)
+        r"(ابحث|بحث|تصفح|سيرش|جوجل|نتائج)\s*(في\s*)?(الويب|الإنترنت|نت|موقع|رابط)",
+        r"(جلب|سحب|كشط|scrape|firecrawl)\s*(محتوى|صفحة|موقع)",
+        r"(توثيق|مكتبة|دليل|docs|context7|library)\s*(برمجية|كود)",
+        
+        # أدوات الأتمتة والربط المتقدم (Composio)
+        r"(إرسال|ربط|اتصال|جلسة|composio|جيميل|سلاك|جيت هاب|gmail|slack|github|email|بريد)",
+        r"(تنزيل|تحميل|حفظ)\s*(رابط|فيديو|صوت|ملف|ميديا)"
     ]
 
-    for pattern in creation_patterns:
+    # فحص تطابق الأنماط مع النص الممرر
+    for pattern in agent_intent_patterns:
         if re.search(pattern, user_text):
+            logger.info(f"🎯 تم رصد نية أتمتة مطابقة للنمط: {pattern}")
             return True
 
-    # 3. إذا كانت الكلمات المفتاحية عامة دون طلب إنشاء، لا نفعّل الوكيل
-    general_keywords = ["مرحباً", "كيف", "ما هو", "أخبرني", "اشرح"]
-    if any(kw in user_text for kw in general_keywords):
-        return False
-
-    # 4. افتراضياً: لا نستخدم وضع الوكيل (تدفق عادي)
+    # 5. افتراضياً: محادثة عادية وتدفق فوري (Streaming Mode) لضمان السرعة والتجربة السلسة
     return False
 
 
@@ -109,9 +130,9 @@ async def _stream(request: ChatCompletionRequest, model: str):
     """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     try:
-        # ✅ القرار الذكي: تفعيل الوكيل فقط عند طلب إنشاء ملف
+        # ✅ القرار الذكي المعدّل: تفعيل الوكيل بناءً على تحليل النية الموسع والعميق
         if _should_use_agent_mode(request):
-            logger.info("🧠 الوكيل في وضع Agent (طلب إنشاء ملف)")
+            logger.info("🧠 الوكيل في وضع Agent (طلب يحتاج أتمتة واستدعاء أدوات)")
             content, tool_calls, finish_reason = await runner.run(request)
 
             delta = DeltaMessage(role="assistant", content=content)
@@ -134,8 +155,8 @@ async def _stream(request: ChatCompletionRequest, model: str):
             yield "data: [DONE]\n\n"
             return
 
-        # ✅ وضع المحادثة العادية (تدفق حقيقي)
-        logger.info("📝 الوكيل في وضع Chat (محادثة عادية)")
+        # ✅ وضع المحادثة العادية (تدفق حقيقي وسريع)
+        logger.info("📝 الوكيل في وضع Chat (محادثة عادية متدفقة)")
         messages = runner._prepare_messages(request, strict=False)
         stream = client.chat.completions.stream(model=model, messages=messages)
 
