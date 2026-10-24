@@ -1,12 +1,15 @@
 # hub.py
 # مدير الأدوات الموحد (MCP + Local) مع Circuit Breaker محسّن ومعالجة متقدمة
 # ★ معدّل لدعم Composio مع الحفاظ على جميع أدوات MCP
+# ★★ إصدار محسّن: دعم ${ENV_VAR} + عزل مستخدمين فعلي
 
 import json
 import logging
 import asyncio
 import inspect
 import time
+import os
+import re
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass, field
@@ -24,6 +27,30 @@ from dependency_injector import DependencyInjector
 
 logger = logging.getLogger("hub")
 
+
+# ══════════════════════════════════════════════════════════
+# ★ حل متغيرات البيئة ${VAR} في التكوين
+# ══════════════════════════════════════════════════════════
+
+def _resolve_env_vars(value):
+    """
+    يستبدل ${VAR_NAME} بقيمة متغير البيئة.
+    يدعم str, dict, list بشكل متداخل.
+    إذا لم يوجد المتغير، يترك النص كما هو.
+    """
+    if isinstance(value, str):
+        return re.sub(
+            r'\$\{(\w+)\}',
+            lambda m: os.environ.get(m.group(1), m.group(0)),
+            value
+        )
+    elif isinstance(value, dict):
+        return {k: _resolve_env_vars(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_resolve_env_vars(v) for v in value]
+    return value
+
+
 # ══════════════════════════════════════════════════════════
 # استثناءات مخصصة
 # ══════════════════════════════════════════════════════════
@@ -33,6 +60,7 @@ class ToolNotFound(ToolError): pass
 class ToolDisabled(ToolError): pass
 class ToolExecutionError(ToolError): pass
 class CircuitOpenError(ToolError): pass
+
 
 # ══════════════════════════════════════════════════════════
 # AccessContext
@@ -45,6 +73,7 @@ class AccessContext:
         self.allowed_domains = allowed_domains
         self.allowed_tags = allowed_tags
         self.allowed_tools = allowed_tools
+
 
 # ══════════════════════════════════════════════════════════
 # ToolRoute
@@ -60,6 +89,7 @@ class ToolRoute:
     input_schema: Dict[str, Any]
     domain: str
     tags: Tuple[str, ...]
+
 
 # ══════════════════════════════════════════════════════════
 # Circuit Breaker (محسّن)
@@ -133,6 +163,7 @@ class CircuitBreaker:
             "success_rate": f"{self._successful_requests / max(1, self._total_requests) * 100:.1f}%"
         }
 
+
 # ══════════════════════════════════════════════════════════
 # MCPSession
 # ══════════════════════════════════════════════════════════
@@ -163,7 +194,8 @@ class MCPSession:
                 if not url:
                     raise ValueError("URL required for streamable-http transport")
                 
-                headers = self.config.get("headers", {})
+                # ★ حل متغيرات البيئة في headers
+                headers = _resolve_env_vars(self.config.get("headers", {}))
                 read, write, _ = await self.exit_stack.enter_async_context(
                     streamablehttp_client(url, headers=headers)
                 )
@@ -203,6 +235,7 @@ class MCPSession:
                 self.session = None
                 self.exit_stack = None
 
+
 # ══════════════════════════════════════════════════════════
 # LocalRuntime
 # ══════════════════════════════════════════════════════════
@@ -235,6 +268,7 @@ class LocalRuntime:
                 
         except Exception as e:
             raise ToolExecutionError(f"Local tool error: {e}")
+
 
 # ══════════════════════════════════════════════════════════
 # MCPRegistry — المعدل لدعم Composio مع الحفاظ على جميع الأدوات
@@ -334,6 +368,9 @@ class MCPRegistry:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
         
+        # ★ حل متغيرات البيئة في التكوين كامل
+        config = _resolve_env_vars(config)
+        
         started = []
         errors = {}
         
@@ -388,10 +425,30 @@ class MCPRegistry:
         logger.info("✅ All servers shut down")
     
     # ══════════════════════════════════════════════════════════
-    # ★ Call Tool — يدعم Composio و MCP
+    # ★ Call Tool — يدعم Composio و MCP مع عزل مستخدمين فعلي
     # ══════════════════════════════════════════════════════════
     
     async def call_tool(self, public_name: str, arguments: Dict[str, Any], context: Optional[AccessContext] = None, request: Optional[Request] = None) -> Dict[str, Any]:
+        
+        # ★ عزل المستخدمين الفعلي
+        client_id = getattr(context, "client_id", "internal")
+        logger.info(f"🔑 call_tool: client_id={client_id}, tool={public_name}")
+        
+        # فحص allowed_tools
+        if context is not None and context.allowed_tools is not None:
+            if public_name not in context.allowed_tools:
+                raise ToolNotFound(
+                    f"Tool '{public_name}' not allowed for client '{client_id}'"
+                )
+        
+        # فحص allowed_servers
+        if context is not None and context.allowed_servers is not None:
+            route = self.tool_routes.get(public_name)
+            if route is not None and route.server_name not in context.allowed_servers:
+                raise ToolNotFound(
+                    f"Server '{route.server_name}' not allowed for client '{client_id}'"
+                )
+        
         # 1. ★ Local tools (Composio وغيرها)
         real_name = self.local_aliases.get(public_name, public_name)
         if real_name in self.local_runtimes:
@@ -525,6 +582,7 @@ class MCPRegistry:
             self.circuit_breakers[server_name].reset()
             return True
         return False
+
 
 # ══════════════════════════════════════════════════════════
 # Factory Function
