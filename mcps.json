@@ -212,7 +212,7 @@
       "max_pages": 50
     },
     "composio-mcp": {
-      "enabled": true,
+      "enabled": false,
       "transport": "stdio",
       "command": "npx",
       "args": ["-y", "composio-mcp"],
