@@ -1,4 +1,6 @@
+# tools.py
 # جميع الأدوات المحلية مع دعم اللغة العربية
+# ★ نسخة نهائية: قراءة كسولة لكل متغيرات البيئة + read_pdf حقيقية + composio_revoke_account
 
 import os
 import io
@@ -22,6 +24,49 @@ from reportlab.lib.enums import TA_RIGHT
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
+
+# ══════════════════════════════════════════════════════════
+# ★ قراءة متغيرات البيئة (كسولة — لا تُثبَّت وقت الاستيراد)
+# ══════════════════════════════════════════════════════════
+
+def _env(*names: str, default: Optional[str] = None) -> Optional[str]:
+    """يقرأ أول متغير بيئة موجود من القائمة."""
+    for name in names:
+        val = os.environ.get(name)
+        if val and val.strip():
+            return val.strip()
+    return default
+
+
+_COMPOSIO_KEY_ALIASES = (
+    "COMPOSIO_API_KEY",
+    "COMPOSIO_KEY",
+    "COMPOSIO_TOKEN",
+    "COMPOSIO_API_TOKEN",
+)
+
+
+def _get_composio_key(api_key: Optional[str] = None) -> Optional[str]:
+    """يرجع المفتاح من المعامل أو من متغيرات البيئة (بأي اسم)."""
+    if api_key and str(api_key).strip():
+        return str(api_key).strip()
+    return _env(*_COMPOSIO_KEY_ALIASES)
+
+
+def _get_composio_base_url() -> str:
+    """يُقرأ في كل استدعاء — آمن لـ HuggingFace (لا يُثبَّت وقت الاستيراد)."""
+    return _env(
+        "COMPOSIO_BASE_URL",
+        "COMPOSIO_API_URL",
+        default="https://backend.composio.dev/api/v3"
+    )
+
+
+def _get_composio_default_user_id() -> str:
+    """يُقرأ في كل استدعاء."""
+    return _env("COMPOSIO_USER_ID", default="default")
+
+
 # ══════════════════════════════════════════════════════════
 # دعم اللغة العربية في ملفات PDF
 # ══════════════════════════════════════════════════════════
@@ -37,7 +82,7 @@ _arabic_font_ready = False
 
 
 async def _ensure_arabic_font() -> None:
-    """تأكد من وجود الخط العربي، وحمله إذا لم يكن موجوداً"""
+    """تأكد من وجود الخط العربي، وحمله إذا لم يكن موجوداً."""
     global _arabic_font_ready
     try:
         if not ARABIC_FONT_PATH.exists():
@@ -45,8 +90,6 @@ async def _ensure_arabic_font() -> None:
                 r = await client.get(ARABIC_FONT_URL)
                 r.raise_for_status()
                 ARABIC_FONT_PATH.write_bytes(r.content)
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
         pdfmetrics.registerFont(TTFont(ARABIC_FONT_NAME, str(ARABIC_FONT_PATH)))
         _arabic_font_ready = True
         print("✅ تم تجهيز الخط العربي بنجاح")
@@ -56,7 +99,7 @@ async def _ensure_arabic_font() -> None:
 
 
 def _shape_text(text: str) -> str:
-    """إعادة تشكيل النص العربي للعرض الصحيح في PDF"""
+    """إعادة تشكيل النص العربي للعرض الصحيح في PDF."""
     try:
         import arabic_reshaper
         from bidi.algorithm import get_display
@@ -74,7 +117,6 @@ def _shape_text(text: str) -> str:
 # ══════════════════════════════════════════════════════════
 @dataclass
 class LocalTool:
-    """تمثيل وصفي للأداة"""
     name: str
     description: str
     parameters: Dict[str, Any]
@@ -101,9 +143,8 @@ def tool(
     aliases: Optional[List[str]] = None,
     tags: Optional[List[str]] = None,
     enabled: bool = True,
-    hidden: bool = False
+    hidden: bool = False,
 ) -> Callable:
-    """Decorator لتسجيل الأدوات المحلية"""
     def wrapper(fn: Callable) -> Callable:
         tool_name = name or fn.__name__
         TOOLS[tool_name] = LocalTool(
@@ -115,7 +156,7 @@ def tool(
             aliases=aliases or [],
             tags=tags or [],
             enabled=enabled,
-            hidden=hidden
+            hidden=hidden,
         )
         return fn
     return wrapper
@@ -141,8 +182,28 @@ def _apply_markdown_lines(add_heading, add_paragraph, add_bullet, text: str):
             add_paragraph(line)
 
 
+def _save_bytes_and_url(
+    data: bytes, ext: str,
+    request: Optional[Request],
+    files_dir: Optional[Path],
+) -> dict:
+    """دالة موحدة لحفظ الملفات وإرجاع الرابط."""
+    if files_dir is None:
+        files_dir = Path.cwd() / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
+    path = files_dir / filename
+    path.write_bytes(data)
+    if request:
+        base_url = str(request.base_url).rstrip("/")
+        file_url = f"{base_url}/files/{filename}"
+    else:
+        file_url = f"/files/{filename}"
+    return {"local_path": str(path), "file_url": file_url}
+
+
 # ══════════════════════════════════════════════════════════
-# 4. أدوات Firecrawl — مُصحَّحة ✅
+# 4. أدوات Firecrawl
 # ══════════════════════════════════════════════════════════
 @tool(
     name="firecrawl_search",
@@ -151,33 +212,31 @@ def _apply_markdown_lines(add_heading, add_paragraph, add_bullet, text: str):
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "نص البحث"},
-            "limit": {"type": "integer", "description": "عدد النتائج", "default": 5}
+            "limit": {"type": "integer", "description": "عدد النتائج", "default": 5},
         },
-        "required": ["query"]
+        "required": ["query"],
     },
     category="Search",
     aliases=["web_search", "search"],
-    tags=["search", "web"]
+    tags=["search", "web"],
 )
 async def firecrawl_search(query: str, limit: int = 5, api_key: Optional[str] = None) -> dict:
-    """بحث في الويب عبر Firecrawl"""
+    api_key = api_key or _env("FIRECRAWL_API_KEY")
     if not api_key:
         return {"error": "FIRECRAWL_API_KEY غير مضبوط"}
 
-    # ✅ إضافة follow_redirects و Content-Type وإزالة raise_for_status
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.post(
             "https://api.firecrawl.dev/v1/search",
             headers={
                 "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             },
             json={"query": query, "limit": limit},
         )
         if r.status_code != 200:
             try:
-                err_data = r.json()
-                err_msg = err_data.get("error", str(err_data))
+                err_msg = r.json().get("error", str(r.json()))
             except Exception:
                 err_msg = r.text[:500]
             return {"error": f"Firecrawl search error ({r.status_code}): {err_msg}"}
@@ -199,34 +258,30 @@ async def firecrawl_search(query: str, limit: int = 5, api_key: Optional[str] = 
     description="تصفح رابط ويب محدد وإرجاع محتواه كـ Markdown نظيف.",
     parameters={
         "type": "object",
-        "properties": {
-            "url": {"type": "string", "description": "الرابط المطلوب تصفحه"}
-        },
-        "required": ["url"]
+        "properties": {"url": {"type": "string", "description": "الرابط المطلوب تصفحه"}},
+        "required": ["url"],
     },
     category="Search",
     aliases=["scrape", "extract"],
-    tags=["search", "web"]
+    tags=["search", "web"],
 )
 async def firecrawl_scrape(url: str, api_key: Optional[str] = None) -> dict:
-    """تصفح ويب"""
+    api_key = api_key or _env("FIRECRAWL_API_KEY")
     if not api_key:
         return {"error": "FIRECRAWL_API_KEY غير مضبوط"}
 
-    # ✅ إضافة follow_redirects و Content-Type و onlyMainContent وإزالة raise_for_status
     async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
         r = await client.post(
             "https://api.firecrawl.dev/v1/scrape",
             headers={
                 "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             },
             json={"url": url, "formats": ["markdown"], "onlyMainContent": True},
         )
         if r.status_code != 200:
             try:
-                err_data = r.json()
-                err_msg = err_data.get("error", str(err_data))
+                err_msg = r.json().get("error", str(r.json()))
             except Exception:
                 err_msg = r.text[:500]
             return {"error": f"Firecrawl scrape error ({r.status_code}): {err_msg}"}
@@ -237,28 +292,25 @@ async def firecrawl_scrape(url: str, api_key: Optional[str] = None) -> dict:
 
 
 # ══════════════════════════════════════════════════════════
-# 5. أدوات Context7 — مُصحَّحة ✅
+# 5. أدوات Context7
 # ══════════════════════════════════════════════════════════
 @tool(
     name="context7_resolve_library",
     description="البحث عن معرّف مكتبة برمجية في Context7.",
     parameters={
         "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "اسم المكتبة أو وصفها"}
-        },
-        "required": ["query"]
+        "properties": {"query": {"type": "string", "description": "اسم المكتبة أو وصفها"}},
+        "required": ["query"],
     },
     category="Documentation",
     aliases=["resolve_lib", "find_library"],
-    tags=["documentation", "libraries"]
+    tags=["documentation", "libraries"],
 )
 async def context7_resolve_library(query: str, api_key: Optional[str] = None) -> dict:
-    """البحث عن مكتبة في Context7"""
+    api_key = api_key or _env("CONTEXT7_API_KEY")
     if not api_key:
         return {"error": "CONTEXT7_API_KEY غير مضبوط"}
 
-    # ✅ تغيير API من v1 إلى v2 وإضافة follow_redirects وإزالة raise_for_status
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.get(
             "https://context7.com/api/v2/libs/search",
@@ -281,20 +333,19 @@ async def context7_resolve_library(query: str, api_key: Optional[str] = None) ->
         "type": "object",
         "properties": {
             "library_id": {"type": "string", "description": "معرّف المكتبة (من context7_resolve_library)"},
-            "topic": {"type": "string", "description": "موضوع معين داخل التوثيق (اختياري)"}
+            "topic": {"type": "string", "description": "موضوع معين داخل التوثيق (اختياري)"},
         },
-        "required": ["library_id"]
+        "required": ["library_id"],
     },
     category="Documentation",
     aliases=["get_docs", "fetch_docs"],
-    tags=["documentation", "libraries"]
+    tags=["documentation", "libraries"],
 )
 async def context7_get_docs(library_id: str, api_key: Optional[str] = None, topic: Optional[str] = None) -> dict:
-    """جلب توثيق مكتبة"""
+    api_key = api_key or _env("CONTEXT7_API_KEY")
     if not api_key:
         return {"error": "CONTEXT7_API_KEY غير مضبوط"}
 
-    # ✅ تغيير API من v1 إلى v2/context وإصلاح المعاملات وإضافة follow_redirects
     if library_id.startswith("/"):
         library_id = library_id[1:]
 
@@ -310,7 +361,7 @@ async def context7_get_docs(library_id: str, api_key: Optional[str] = None, topi
             params=params,
             headers={
                 "Authorization": f"Bearer {api_key}",
-                "X-Context7-Source": "mcp-server"
+                "X-Context7-Source": "mcp-server",
             },
         )
         if r.status_code != 200:
@@ -321,12 +372,8 @@ async def context7_get_docs(library_id: str, api_key: Optional[str] = None, topi
 
 
 # ══════════════════════════════════════════════════════════
-# 6. أدوات Composio — مُصحَّحة ✅
+# 6. أدوات Composio (قراءة كسولة + revoke)
 # ══════════════════════════════════════════════════════════
-COMPOSIO_BASE_URL = "https://backend.composio.dev/api/v3"
-COMPOSIO_BASE_URL_V31 = "https://backend.composio.dev/api/v3.1"
-COMPOSIO_DEFAULT_USER_ID = "default"
-
 
 @tool(
     name="composio_list_connected_tools",
@@ -334,21 +381,20 @@ COMPOSIO_DEFAULT_USER_ID = "default"
     parameters={"type": "object", "properties": {}},
     category="Integration",
     aliases=["list_connected"],
-    tags=["composio", "integration"]
+    tags=["composio", "integration"],
 )
 async def composio_list_connected_tools(api_key: Optional[str] = None) -> dict:
-    """عرض التطبيقات المرتبطة"""
+    api_key = _get_composio_key(api_key)
     if not api_key:
-        return {"error": "COMPOSIO_API_KEY غير مضبوط"}
+        return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
 
-    # ✅ إضافة follow_redirects ومعالجة 401 بشكل صريح بدلاً من raise_for_status
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.get(
-            f"{COMPOSIO_BASE_URL}/connected_accounts",
+            f"{_get_composio_base_url()}/connected_accounts",
             headers={"x-api-key": api_key},
         )
         if r.status_code == 401:
-            return {"error": "مفتاح Composio API غير صالح أو منتهي. تحقق من COMPOSIO_API_KEY في Environment Variables."}
+            return {"error": "مفتاح Composio API غير صالح أو منتهي. تحقق من COMPOSIO_API_KEY."}
         if r.status_code != 200:
             return {"error": f"Composio API error ({r.status_code}): {r.text[:500]}"}
         data = r.json()
@@ -370,23 +416,22 @@ async def composio_list_connected_tools(api_key: Optional[str] = None) -> dict:
         "type": "object",
         "properties": {
             "toolkit_slug": {"type": "string", "description": "اسم التطبيق"},
-            "limit": {"type": "integer", "description": "عدد النتائج", "default": 20}
+            "limit": {"type": "integer", "description": "عدد النتائج", "default": 20},
         },
-        "required": ["toolkit_slug"]
+        "required": ["toolkit_slug"],
     },
     category="Integration",
     aliases=["list_tools"],
-    tags=["composio", "integration"]
+    tags=["composio", "integration"],
 )
 async def composio_list_tools(toolkit_slug: str, api_key: Optional[str] = None, limit: int = 20) -> dict:
-    """جلب أدوات تطبيق معين"""
+    api_key = _get_composio_key(api_key)
     if not api_key:
-        return {"error": "COMPOSIO_API_KEY غير مضبوط"}
+        return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
 
-    # ✅ إضافة follow_redirects وإزالة raise_for_status
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.get(
-            f"{COMPOSIO_BASE_URL}/tools",
+            f"{_get_composio_base_url()}/tools",
             params={
                 "toolkit_slug": toolkit_slug,
                 "toolkit_versions": "latest",
@@ -394,6 +439,8 @@ async def composio_list_tools(toolkit_slug: str, api_key: Optional[str] = None, 
             },
             headers={"x-api-key": api_key},
         )
+        if r.status_code == 401:
+            return {"error": "مفتاح Composio API غير صالح."}
         if r.status_code != 200:
             return {"error": f"Composio API error ({r.status_code}): {r.text[:500]}"}
         data = r.json()
@@ -414,45 +461,95 @@ async def composio_list_tools(toolkit_slug: str, api_key: Optional[str] = None, 
         "properties": {
             "slug": {"type": "string", "description": "معرّف الأداة"},
             "arguments": {"type": "object", "description": "معاملات الأداة"},
-            "user_id": {"type": "string", "description": "معرّف المستخدم (اختياري)"}
+            "user_id": {"type": "string", "description": "معرّف المستخدم (اختياري)"},
         },
-        "required": ["slug"]
+        "required": ["slug"],
     },
     category="Integration",
     aliases=["execute_tool"],
-    tags=["composio", "integration"]
+    tags=["composio", "integration"],
 )
 async def composio_execute_tool(
     slug: str,
     api_key: Optional[str] = None,
     arguments: Optional[Dict[str, Any]] = None,
     user_id: Optional[str] = None,
-    version: str = "latest"
+    version: str = "latest",
 ) -> dict:
-    """تنفيذ أداة Composio"""
+    api_key = _get_composio_key(api_key)
     if not api_key:
-        return {"error": "COMPOSIO_API_KEY غير مضبوط"}
+        return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
 
     payload = {
         "arguments": arguments or {},
         "version": version,
-        "user_id": user_id or COMPOSIO_DEFAULT_USER_ID,
+        "user_id": user_id or _get_composio_default_user_id(),
     }
 
-    # ✅ إضافة follow_redirects ومعالجة أكواد الخطأ بشكل صريح
     async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
         r = await client.post(
-            f"{COMPOSIO_BASE_URL}/tools/execute/{slug}",
+            f"{_get_composio_base_url()}/tools/execute/{slug}",
             headers={"x-api-key": api_key, "Content-Type": "application/json"},
             json=payload,
         )
         if r.status_code == 404:
             return {"error": f"الأداة '{slug}' غير موجودة (404)."}
         if r.status_code == 401:
-            return {"error": "مفتاح Composio API غير صالح. تحقق من COMPOSIO_API_KEY."}
+            return {"error": "مفتاح Composio API غير صالح."}
         if r.status_code not in (200, 201):
             return {"error": f"Composio API error ({r.status_code}): {r.text[:500]}"}
         return r.json()
+
+
+@tool(
+    name="composio_revoke_account",
+    description=(
+        "✅ تسجيل الخروج الفعلي من تطبيق Composio — يلغي التفويض ويُبقي السجل "
+        "قابلاً للاستعادة لاحقاً. ⚠️ استدعِ composio_list_connected_tools أولاً للحصول على 'id'."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "connected_account_id": {
+                "type": "string",
+                "description": "معرّف الحساب من حقل 'id' في composio_list_connected_tools.",
+            }
+        },
+        "required": ["connected_account_id"],
+    },
+    category="Integration",
+    aliases=["revoke_account", "logout_composio"],
+    tags=["composio", "integration", "logout"],
+)
+async def composio_revoke_account(connected_account_id: str, api_key: Optional[str] = None) -> dict:
+    api_key = _get_composio_key(api_key)
+    if not api_key:
+        return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
+
+    if not connected_account_id or not connected_account_id.strip():
+        return {
+            "error": "المعامل 'connected_account_id' مطلوب.",
+            "suggestion": "استدعِ composio_list_connected_tools أولاً.",
+        }
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        r = await client.post(
+            f"{_get_composio_base_url()}/connected_accounts/{connected_account_id}/revoke",
+            headers={"x-api-key": api_key},
+        )
+
+    if r.status_code == 404:
+        return {
+            "error": f"الحساب '{connected_account_id}' غير موجود.",
+            "status_code": 404,
+            "suggestion": "تحقق من الـ id عبر composio_list_connected_tools.",
+        }
+    if r.status_code == 401:
+        return {"error": "مفتاح Composio API غير صالح."}
+    if r.status_code not in (200, 201, 204):
+        return {"error": f"Composio API error ({r.status_code}): {r.text[:500]}"}
+
+    return {"ok": True, "revoked": connected_account_id}
 
 
 # ══════════════════════════════════════════════════════════
@@ -465,29 +562,16 @@ async def composio_execute_tool(
         "type": "object",
         "properties": {
             "title": {"type": "string", "description": "عنوان المستند"},
-            "content_markdown": {"type": "string", "description": "محتوى المستند بصيغة Markdown"}
+            "content_markdown": {"type": "string", "description": "محتوى المستند بصيغة Markdown"},
         },
-        "required": ["title", "content_markdown"]
+        "required": ["title", "content_markdown"],
     },
     category="Documents",
     aliases=["docx", "make_docx"],
-    tags=["document", "word"]
+    tags=["document", "word"],
 )
 def create_docx(title: str, content_markdown: str, request: Optional[Request] = None, files_dir: Optional[Path] = None) -> dict:
-    """إنشاء ملف Word مع رابط كامل"""
     from docx import Document
-
-    if files_dir is None:
-        files_dir = Path.cwd() / "files"
-    files_dir.mkdir(parents=True, exist_ok=True)
-
-    def save_bytes(data: bytes, ext: str) -> str:
-        filename = f"{uuid.uuid4().hex}.{ext}"
-        (files_dir / filename).write_bytes(data)
-        if request:
-            base_url = str(request.base_url).rstrip('/')
-            return f"{base_url}/files/{filename}"
-        return f"/files/{filename}"
 
     doc = Document()
     doc.add_heading(title, level=1)
@@ -499,7 +583,7 @@ def create_docx(title: str, content_markdown: str, request: Optional[Request] = 
     )
     buf = io.BytesIO()
     doc.save(buf)
-    return {"file_url": save_bytes(buf.getvalue(), "docx")}
+    return _save_bytes_and_url(buf.getvalue(), "docx", request, files_dir)
 
 
 @tool(
@@ -516,32 +600,19 @@ def create_docx(title: str, content_markdown: str, request: Optional[Request] = 
                     "type": "object",
                     "properties": {
                         "title": {"type": "string", "description": "عنوان الشريحة"},
-                        "bullets": {"type": "array", "items": {"type": "string"}}
-                    }
-                }
-            }
+                        "bullets": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
         },
-        "required": ["title", "slides"]
+        "required": ["title", "slides"],
     },
     category="Documents",
     aliases=["pptx", "make_pptx"],
-    tags=["document", "presentation"]
+    tags=["document", "presentation"],
 )
 def create_pptx(title: str, slides: List[Dict[str, Any]], request: Optional[Request] = None, files_dir: Optional[Path] = None) -> dict:
-    """إنشاء عرض تقديمي مع رابط كامل"""
     from pptx import Presentation
-
-    if files_dir is None:
-        files_dir = Path.cwd() / "files"
-    files_dir.mkdir(parents=True, exist_ok=True)
-
-    def save_bytes(data: bytes, ext: str) -> str:
-        filename = f"{uuid.uuid4().hex}.{ext}"
-        (files_dir / filename).write_bytes(data)
-        if request:
-            base_url = str(request.base_url).rstrip('/')
-            return f"{base_url}/files/{filename}"
-        return f"/files/{filename}"
 
     prs = Presentation()
     title_slide = prs.slides.add_slide(prs.slide_layouts[0])
@@ -557,7 +628,7 @@ def create_pptx(title: str, slides: List[Dict[str, Any]], request: Optional[Requ
             p.text = b
     buf = io.BytesIO()
     prs.save(buf)
-    return {"file_url": save_bytes(buf.getvalue(), "pptx")}
+    return _save_bytes_and_url(buf.getvalue(), "pptx", request, files_dir)
 
 
 @tool(
@@ -567,21 +638,15 @@ def create_pptx(title: str, slides: List[Dict[str, Any]], request: Optional[Requ
         "type": "object",
         "properties": {
             "title": {"type": "string", "description": "عنوان المستند"},
-            "content_markdown": {"type": "string", "description": "محتوى المستند بصيغة Markdown"}
+            "content_markdown": {"type": "string", "description": "محتوى المستند بصيغة Markdown"},
         },
-        "required": ["title", "content_markdown"]
+        "required": ["title", "content_markdown"],
     },
     category="Documents",
     aliases=["pdf", "make_pdf"],
-    tags=["document", "pdf", "arabic"]
+    tags=["document", "pdf", "arabic"],
 )
 def create_pdf(title: str, content_markdown: str, request: Optional[Request] = None, files_dir: Optional[Path] = None) -> dict:
-    """إنشاء ملف PDF مع دعم اللغة العربية"""
-    from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.enums import TA_RIGHT
-
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
@@ -590,18 +655,6 @@ def create_pdf(title: str, content_markdown: str, request: Optional[Request] = N
             loop.run_until_complete(_ensure_arabic_font())
     except Exception:
         pass
-
-    if files_dir is None:
-        files_dir = Path.cwd() / "files"
-    files_dir.mkdir(parents=True, exist_ok=True)
-
-    def save_bytes(data: bytes, ext: str) -> str:
-        filename = f"{uuid.uuid4().hex}.{ext}"
-        (files_dir / filename).write_bytes(data)
-        if request:
-            base_url = str(request.base_url).rstrip('/')
-            return f"{base_url}/files/{filename}"
-        return f"/files/{filename}"
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4)
@@ -615,8 +668,7 @@ def create_pdf(title: str, content_markdown: str, request: Optional[Request] = N
         "Normal": ParagraphStyle("NormalAr", parent=base_styles["Normal"], fontName=font, alignment=TA_RIGHT, fontSize=12, leading=18),
     }
 
-    shaped_title = _shape_text(title)
-    story = [Paragraph(shaped_title, styles["Title"]), Spacer(1, 14)]
+    story = [Paragraph(_shape_text(title), styles["Title"]), Spacer(1, 14)]
 
     def add_heading(text, level):
         style = styles["Heading1"] if level == 1 else styles["Heading2"]
@@ -630,30 +682,68 @@ def create_pdf(title: str, content_markdown: str, request: Optional[Request] = N
 
     _apply_markdown_lines(add_heading, add_paragraph, add_bullet, content_markdown)
     doc.build(story)
-    return {"file_url": save_bytes(buf.getvalue(), "pdf")}
+    return _save_bytes_and_url(buf.getvalue(), "pdf", request, files_dir)
 
 
 @tool(
     name="read_pdf",
-    description="استخراج النص من ملف PDF.",
+    description="استخراج النص من ملف PDF (من URL أو base64).",
     parameters={
         "type": "object",
         "properties": {
             "url": {"type": "string", "description": "رابط ملف PDF"},
             "base64_data": {"type": "string", "description": "بيانات PDF مشفرة بـ base64"},
-            "max_pages": {"type": "integer", "description": "عدد الصفحات", "default": 20}
-        }
+            "max_pages": {"type": "integer", "description": "عدد الصفحات", "default": 20},
+        },
     },
     category="Documents",
     aliases=["extract_pdf"],
-    tags=["document", "pdf"]
+    tags=["document", "pdf"],
 )
 async def read_pdf(url: Optional[str] = None, base64_data: Optional[str] = None, max_pages: int = 20) -> dict:
-    """قراءة ملف PDF"""
+    """قراءة ملف PDF فعلياً من URL أو base64."""
     try:
         import pdfplumber
-        import io
-        return {"text": "PDF content extracted", "pages_read": max_pages}
+    except ImportError:
+        return {"error": "مكتبة pdfplumber غير مثبتة. أضفها إلى requirements.txt"}
+
+    # 1) جلب البيانات
+    if base64_data:
+        try:
+            data = base64.b64decode(base64_data)
+        except Exception as e:
+            return {"error": f"فشل فك base64: {e}"}
+    elif url:
+        try:
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                data = r.content
+        except Exception as e:
+            return {"error": f"فشل تحميل PDF: {e}"}
+    else:
+        return {"error": "يجب توفير url أو base64_data"}
+
+    # 2) استخراج النص
+    try:
+        text_parts: List[str] = []
+        pages_read = 0
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            for i, page in enumerate(pdf.pages):
+                if i >= max_pages:
+                    break
+                page_text = page.extract_text() or ""
+                if page_text:
+                    text_parts.append(page_text)
+                pages_read += 1
+
+        full_text = "\n\n".join(text_parts)
+        return {
+            "text": full_text[:50000],
+            "pages_read": pages_read,
+            "total_chars": len(full_text),
+            "truncated": len(full_text) > 50000,
+        }
     except Exception as e:
         return {"error": f"PDF reading failed: {e}"}
 
@@ -666,29 +756,16 @@ async def read_pdf(url: Optional[str] = None, base64_data: Optional[str] = None,
         "properties": {
             "title": {"type": "string", "description": "اسم الورقة"},
             "headers": {"type": "array", "items": {"type": "string"}},
-            "rows": {"type": "array", "items": {"type": "array"}}
+            "rows": {"type": "array", "items": {"type": "array"}},
         },
-        "required": ["title"]
+        "required": ["title"],
     },
     category="Documents",
     aliases=["xlsx", "make_xlsx"],
-    tags=["document", "excel"]
+    tags=["document", "excel"],
 )
 def create_xlsx(title: str, headers: Optional[List[str]] = None, rows: Optional[List[List[Any]]] = None, request: Optional[Request] = None, files_dir: Optional[Path] = None) -> dict:
-    """إنشاء ملف Excel مع رابط كامل"""
     import openpyxl
-
-    if files_dir is None:
-        files_dir = Path.cwd() / "files"
-    files_dir.mkdir(parents=True, exist_ok=True)
-
-    def save_bytes(data: bytes, ext: str) -> str:
-        filename = f"{uuid.uuid4().hex}.{ext}"
-        (files_dir / filename).write_bytes(data)
-        if request:
-            base_url = str(request.base_url).rstrip('/')
-            return f"{base_url}/files/{filename}"
-        return f"/files/{filename}"
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -699,7 +776,7 @@ def create_xlsx(title: str, headers: Optional[List[str]] = None, rows: Optional[
         ws.append(row)
     buf = io.BytesIO()
     wb.save(buf)
-    return {"file_url": save_bytes(buf.getvalue(), "xlsx")}
+    return _save_bytes_and_url(buf.getvalue(), "xlsx", request, files_dir)
 
 
 @tool(
@@ -707,17 +784,14 @@ def create_xlsx(title: str, headers: Optional[List[str]] = None, rows: Optional[
     description="تحويل نص Markdown إلى HTML.",
     parameters={
         "type": "object",
-        "properties": {
-            "markdown_text": {"type": "string", "description": "نص Markdown"}
-        },
-        "required": ["markdown_text"]
+        "properties": {"markdown_text": {"type": "string", "description": "نص Markdown"}},
+        "required": ["markdown_text"],
     },
     category="Documents",
     aliases=["md_to_html"],
-    tags=["document", "markdown", "html"]
+    tags=["document", "markdown", "html"],
 )
 def markdown_to_html(markdown_text: str) -> dict:
-    """تحويل Markdown إلى HTML"""
     import markdown as md
     html = md.markdown(markdown_text, extensions=["tables", "fenced_code"])
     return {"html": html}
@@ -734,15 +808,14 @@ def markdown_to_html(markdown_text: str) -> dict:
         "properties": {
             "url": {"type": "string", "description": "رابط الملف"},
             "base64_data": {"type": "string", "description": "بيانات الملف مشفرة بـ base64"},
-            "ext": {"type": "string", "description": "امتداد الملف", "default": "mp4"}
-        }
+            "ext": {"type": "string", "description": "امتداد الملف", "default": "mp4"},
+        },
     },
     category="Media",
     aliases=["download_media"],
-    tags=["media", "file"]
+    tags=["media", "file"],
 )
 async def fetch_media_to_file(url: Optional[str] = None, base64_data: Optional[str] = None, ext: str = "mp4", request: Optional[Request] = None, files_dir: Optional[Path] = None) -> dict:
-    """تحميل وحفظ ملف وسائط مع رابط كامل"""
     if base64_data:
         data = base64.b64decode(base64_data)
     elif url:
@@ -753,20 +826,7 @@ async def fetch_media_to_file(url: Optional[str] = None, base64_data: Optional[s
     else:
         return {"error": "يجب توفير url أو base64_data"}
 
-    if files_dir is None:
-        files_dir = Path.cwd() / "files"
-    files_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
-    path = files_dir / filename
-    path.write_bytes(data)
-
-    if request:
-        base_url = str(request.base_url).rstrip('/')
-        file_url = f"{base_url}/files/{filename}"
-    else:
-        file_url = f"/files/{filename}"
-
-    return {"local_path": str(path), "file_url": file_url}
+    return _save_bytes_and_url(data, ext, request, files_dir)
 
 
 @tool(
@@ -776,34 +836,21 @@ async def fetch_media_to_file(url: Optional[str] = None, base64_data: Optional[s
         "type": "object",
         "properties": {
             "content": {"type": "string", "description": "المحتوى النصي"},
-            "ext": {"type": "string", "description": "امتداد الملف", "default": "txt"}
+            "ext": {"type": "string", "description": "امتداد الملف", "default": "txt"},
         },
-        "required": ["content"]
+        "required": ["content"],
     },
     category="Media",
     aliases=["write_file"],
-    tags=["file", "text"]
+    tags=["file", "text"],
 )
 def write_text_file(content: str, ext: str = "txt", request: Optional[Request] = None, files_dir: Optional[Path] = None) -> dict:
-    """كتابة ملف نصي مع رابط كامل"""
-    if files_dir is None:
-        files_dir = Path.cwd() / "files"
-    files_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
-    path = files_dir / filename
-    path.write_text(content, encoding="utf-8")
-
-    if request:
-        base_url = str(request.base_url).rstrip('/')
-        file_url = f"{base_url}/files/{filename}"
-    else:
-        file_url = f"/files/{filename}"
-
-    return {"local_path": str(path), "file_url": file_url}
+    data = content.encode("utf-8")
+    return _save_bytes_and_url(data, ext, request, files_dir)
 
 
 # ══════════════════════════════════════════════════════════
-# 9. أداة Ping (للاختبار)
+# 9. أداة Ping
 # ══════════════════════════════════════════════════════════
 @tool(
     name="ping",
@@ -811,7 +858,7 @@ def write_text_file(content: str, ext: str = "txt", request: Optional[Request] =
     parameters={"type": "object", "properties": {}, "required": []},
     category="Utility",
     aliases=["health", "check"],
-    tags=["utility", "diagnostic"]
+    tags=["utility", "diagnostic"],
 )
 async def ping() -> Dict[str, Any]:
     return {"ok": True, "message": "pong"}
