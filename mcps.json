@@ -258,6 +258,19 @@
       "max_discovery_items": 1000,
       "max_pages": 50,
       "comment": "خادم HTML to Video مجاني (Clip.A.Canvas) مستضاف على HF Spaces."
+    },
+    "three-ws-studio": {
+      "enabled": true,
+      "transport": "streamable-http",
+      "url": "https://three.ws/api/mcp-studio",
+      "timeout": 180,
+      "max_concurrency": 3,
+      "tool_prefix": "studio",
+      "domain": "3d-generation",
+      "tags": ["3d", "ai", "avatar", "rigging", "glb"],
+      "max_result_bytes": 20971520,
+      "max_discovery_items": 1000,
+      "max_pages": 50
     }
   }
 }
