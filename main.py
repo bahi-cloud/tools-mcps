@@ -3,6 +3,7 @@
 # + عزل المستخدمين في /call + composio_revoke_account + /composio/disconnect
 # + قراءة كسولة لـ COMPOSIO_API_KEY و COMPOSIO_DEFAULT_USER_ID
 # + revoke_account على v3.1 مع revoke_on_delete=true (الحل النهائي)
+# + عزل الملفات لكل مستخدم (client_id) + روابط كاملة للملفات
 import os
 import io
 import json
@@ -14,7 +15,8 @@ import asyncio
 import logging
 import traceback
 import shutil
-import hashlib  # ★ NEW: لعزل المستخدمين
+import hashlib
+import contextvars  # ★ NEW: لعزل الملفات
 from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -28,6 +30,13 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger("main")
 logging.basicConfig(level=logging.INFO)
+
+# ══════════════════════════════════════════════════════════
+# ★ متغير سياق لعزل الملفات بين المستخدمين
+# ══════════════════════════════════════════════════════════
+_current_client_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_client_id", default="anonymous"
+)
 
 # ══════════════════════════════════════════════════════════
 # استيراد Hub Core
@@ -103,6 +112,41 @@ def _get_composio_api_key() -> str:
 def _get_composio_default_user_id() -> str:
     """★ تُقرأ في كل استدعاء — لا تُثبَّت وقت الاستيراد."""
     return os.environ.get("COMPOSIO_DEFAULT_USER_ID", "default") or "default"
+
+
+# ══════════════════════════════════════════════════════════
+# ★ دوال عزل الملفات والروابط الكاملة
+# ══════════════════════════════════════════════════════════
+
+def _full_file_url(relative_path: str) -> str:
+    """★ يحول المسار النسبي إلى رابط كامل باستخدام SPACE_BASE_URL."""
+    if not relative_path:
+        return ""
+    if relative_path.startswith("http"):
+        return relative_path
+    base = SPACE_BASE_URL.rstrip("/") if SPACE_BASE_URL else ""
+    return f"{base}{relative_path}" if base else relative_path
+
+
+def save_bytes(data: bytes, ext: str, client_id: str = None) -> str:
+    """
+    ★ حفظ آمن: يعزل ملفات كل مستخدم في مجلد خاص به.
+    يعيد المسار النسبي (وليس الكامل) — استخدم _full_file_url للرابط الكامل.
+    """
+    if client_id is None:
+        client_id = _current_client_id.get()
+    
+    # تنظيف client_id لمنع أي محاولة اختراق مسار (Path Traversal)
+    safe_client = "".join(c for c in client_id if c.isalnum() or c in "-_")[:32] or "anonymous"
+    
+    # إنشاء مجلد المستخدم إذا لم يكن موجوداً
+    user_dir = FILES_DIR / safe_client
+    user_dir.mkdir(parents=True, exist_ok=True)
+    
+    filename = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
+    (user_dir / filename).write_bytes(data)
+    
+    return f"/files/{safe_client}/{filename}"
 
 
 # ══════════════════════════════════════════════════════════
@@ -327,7 +371,7 @@ async def lifespan(app: FastAPI):
     await registry.shutdown()
 
 
-app = FastAPI(title="9Router Tools Server", version="1.0.4", lifespan=lifespan)
+app = FastAPI(title="9Router Tools Server", version="1.0.5", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -347,12 +391,6 @@ async def _security_headers(request, call_next):
 app.mount("/files", StaticFiles(directory=str(FILES_DIR)), name="files")
 
 
-def save_bytes(data: bytes, ext: str) -> str:
-    filename = f"{uuid.uuid4().hex}.{ext}"
-    (FILES_DIR / filename).write_bytes(data)
-    return f"/files/{filename}"
-
-
 def move_to_files(source_path: str, filename: str = None) -> str:
     dest_dir = Path("/app/files")
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -360,7 +398,7 @@ def move_to_files(source_path: str, filename: str = None) -> str:
         filename = Path(source_path).name
     dest_path = dest_dir / filename
     shutil.copy2(source_path, dest_path)
-    return f"/files/{filename}"
+    return _full_file_url(f"/files/{filename}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -496,7 +534,7 @@ async def context7_get_docs(library_id: str, topic: Optional[str] = None) -> dic
 # ══════════════════════════════════════════════════════════
 
 async def composio_list_connected_tools() -> dict:
-    api_key = _get_composio_api_key()  # ★ KISY
+    api_key = _get_composio_api_key()
     if not api_key:
         return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
 
@@ -505,7 +543,6 @@ async def composio_list_connected_tools() -> dict:
             f"{COMPOSIO_BASE_URL}/connected_accounts",
             headers={"x-api-key": api_key},
         )
-        # ★ معالجة صريحة بدل raise_for_status()
         if r.status_code == 401:
             return {"error": "مفتاح Composio API غير صالح أو منتهي. تحقق من COMPOSIO_API_KEY."}
         if r.status_code != 200:
@@ -809,7 +846,7 @@ async def composio_close_session(session_id: str) -> dict:
         return r.json() if r.content else {"ok": True, "closed": session_id}
 
 
-# ★ ★ ★ NEW: composio_revoke_account (تسجيل الخروج الفعلي — v3.1 + DELETE) ★ ★ ★
+# ★ ★ ★ composio_revoke_account (تسجيل الخروج الفعلي — v3.1 + DELETE) ★ ★ ★
 async def composio_revoke_account(connected_account_id: str) -> dict:
     """
     ✅ تسجيل خروج فعلي: حذف الحساب من Composio وإلغاء التوثيق.
@@ -900,7 +937,8 @@ def create_docx(title: str, content_markdown: str) -> dict:
     )
     buf = io.BytesIO()
     doc.save(buf)
-    return {"file_url": save_bytes(buf.getvalue(), "docx")}
+    rel = save_bytes(buf.getvalue(), "docx")
+    return {"file_url": _full_file_url(rel), "relative_path": rel}
 
 
 def create_pptx(title: str, slides: List[Dict[str, Any]]) -> dict:
@@ -919,7 +957,8 @@ def create_pptx(title: str, slides: List[Dict[str, Any]]) -> dict:
             p.text = b
     buf = io.BytesIO()
     prs.save(buf)
-    return {"file_url": save_bytes(buf.getvalue(), "pptx")}
+    rel = save_bytes(buf.getvalue(), "pptx")
+    return {"file_url": _full_file_url(rel), "relative_path": rel}
 
 
 def create_pdf(title: str, content_markdown: str) -> dict:
@@ -945,7 +984,8 @@ def create_pdf(title: str, content_markdown: str) -> dict:
         content_markdown,
     )
     doc.build(story)
-    return {"file_url": save_bytes(buf.getvalue(), "pdf")}
+    rel = save_bytes(buf.getvalue(), "pdf")
+    return {"file_url": _full_file_url(rel), "relative_path": rel}
 
 
 async def read_pdf(url: Optional[str] = None, base64_data: Optional[str] = None, max_pages: int = 20) -> dict:
@@ -983,7 +1023,8 @@ def create_xlsx(title: str, headers: Optional[List[str]] = None, rows: Optional[
         ws.append(row)
     buf = io.BytesIO()
     wb.save(buf)
-    return {"file_url": save_bytes(buf.getvalue(), "xlsx")}
+    rel = save_bytes(buf.getvalue(), "xlsx")
+    return {"file_url": _full_file_url(rel), "relative_path": rel}
 
 
 async def read_xlsx(url: Optional[str] = None, base64_data: Optional[str] = None, sheet: Optional[str] = None) -> dict:
@@ -1005,17 +1046,15 @@ def markdown_to_html(markdown_text: str) -> dict:
 
 async def fetch_media_to_file(url: Optional[str] = None, base64_data: Optional[str] = None, ext: str = "mp4") -> dict:
     data = await _download(url, base64_data)
-    filename = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
-    path = FILES_DIR / filename
-    path.write_bytes(data)
-    return {"local_path": str(path), "file_url": f"/files/{filename}"}
+    rel = save_bytes(data, ext)
+    return {"local_path": str(FILES_DIR / rel.lstrip("/").replace("files/", "", 1)), "file_url": _full_file_url(rel), "relative_path": rel}
 
 
 def write_text_file(content: str, ext: str = "srt") -> dict:
-    filename = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
-    path = FILES_DIR / filename
-    path.write_text(content, encoding="utf-8")
-    return {"local_path": str(path), "file_url": f"/files/{filename}"}
+    rel = save_bytes(content.encode("utf-8"), ext)
+    # local_path يبقى بنفس التنسيق القديم للتوافق مع أدوات الفيديو
+    local = str(FILES_DIR / rel.lstrip("/").replace("files/", "", 1))
+    return {"local_path": local, "file_url": _full_file_url(rel), "relative_path": rel}
 
 
 # ══════════════════════════════════════════════════════════
@@ -1034,7 +1073,7 @@ TOOL_FUNCTIONS = {
     "composio_session_toolkits": composio_session_toolkits,
     "composio_authorize_toolkit": composio_authorize_toolkit,
     "composio_close_session": composio_close_session,
-    "composio_revoke_account": composio_revoke_account,  # ★ NEW
+    "composio_revoke_account": composio_revoke_account,
     "create_docx": create_docx,
     "create_pptx": create_pptx,
     "create_pdf": create_pdf,
@@ -1147,7 +1186,6 @@ TOOLS_MANIFEST.extend([
             "session_id": {"type": "string"},
         }, "required": ["session_id"]},
     }},
-    # ★ ★ ★ NEW: composio_revoke_account ★ ★ ★
     {"type": "function", "function": {
         "name": "composio_revoke_account",
         "description": (
@@ -1289,6 +1327,8 @@ async def health():
         "hub_ready": True,
         "hub_servers": len(registry.servers) if hasattr(registry, 'servers') else 0,
         "super_agent_enabled": is_super_agent_enabled(),
+        "files_isolation": True,
+        "space_base_url_set": bool(SPACE_BASE_URL),
     }
 
 
@@ -1423,7 +1463,11 @@ ALLOWED_UPLOAD_EXTS = {
 
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), x_api_key: str = Header(default="")):
+async def upload_file(
+    file: UploadFile = File(...),
+    x_api_key: str = Header(default=""),
+    x_client_id: str = Header(default=""),
+):
     _check_auth(x_api_key)
     orig_ext = Path(file.filename or "").suffix.lower() or ""
     if orig_ext not in ALLOWED_UPLOAD_EXTS:
@@ -1432,8 +1476,17 @@ async def upload_file(file: UploadFile = File(...), x_api_key: str = Header(defa
             f"امتداد الملف '{orig_ext or '(بدون امتداد)'}' غير مسموح. "
             f"المسموحة: {', '.join(sorted(ALLOWED_UPLOAD_EXTS))}",
         )
+    
+    # ★ عزل الملفات بحسب client_id
+    cid = x_client_id.strip() or (
+        hashlib.sha256(x_api_key.encode()).hexdigest()[:16] if x_api_key else "anonymous"
+    )
+    safe_client = "".join(c for c in cid if c.isalnum() or c in "-_")[:32] or "anonymous"
+    user_dir = FILES_DIR / safe_client
+    user_dir.mkdir(parents=True, exist_ok=True)
+    
     filename = f"{uuid.uuid4().hex}{orig_ext}"
-    dest = FILES_DIR / filename
+    dest = user_dir / filename
     size = 0
     try:
         with open(dest, "wb") as out:
@@ -1457,17 +1510,19 @@ async def upload_file(file: UploadFile = File(...), x_api_key: str = Header(defa
         raise HTTPException(500, f"فشل حفظ الملف: {e}")
     finally:
         await file.close()
+    
+    rel = f"/files/{safe_client}/{filename}"
     return {
         "ok": True,
         "filename": filename,
         "original_filename": file.filename,
         "local_path": str(dest),
-        "file_url": f"/files/{filename}",
+        "file_url": _full_file_url(rel),
+        "relative_path": rel,
         "size_bytes": size,
     }
 
 
-# ★ ★ ★ NEW: endpoint مباشر لتسجيل الخروج (لا يحتاج وكيل) ★ ★ ★
 @app.post("/composio/disconnect")
 async def composio_disconnect_endpoint(
     connected_account_id: str,
@@ -1485,7 +1540,7 @@ async def composio_disconnect_endpoint(
 async def call_tool(
     req: CallRequest,
     x_api_key: str = Header(default=""),
-    x_client_id: str = Header(default=""),  # ★ NEW
+    x_client_id: str = Header(default=""),
 ):
     _check_auth(x_api_key)
 
@@ -1494,6 +1549,13 @@ async def call_tool(
             403,
             "الوكيل الخارق معطّل — فعّله عبر POST /super-agent/toggle {\"enabled\": true}.",
         )
+
+    # ★ حساب client_id وضبطه في السياق لتعزيل الملفات
+    client_id = (
+        x_client_id.strip()
+        or (hashlib.sha256(x_api_key.encode()).hexdigest()[:16] if x_api_key else "anonymous")
+    )
+    _current_client_id.set(client_id)
 
     # 1. أدوات الفيديو
     if req.tool in video_tool_names:
@@ -1531,12 +1593,6 @@ async def call_tool(
     if req.tool not in registry.tool_routes:
         logger.warning(f"Tool '{req.tool}' not found. Available: {list(registry.tool_routes.keys())}")
 
-    # ★ ★ ★ عزل المستخدمين — استبدال internal_context() ★ ★ ★
-    client_id = (
-        x_client_id.strip()
-        or req.arguments.pop("_client_id", None)
-        or (hashlib.sha256(x_api_key.encode()).hexdigest()[:16] if x_api_key else "anonymous")
-    )
     context = AccessContext(client_id=client_id)
 
     try:
