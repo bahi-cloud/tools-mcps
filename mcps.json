@@ -244,7 +244,7 @@
       "max_pages": 50
     },
     "clip-a-canvas": {
-      "enabled": false,
+      "enabled": true,
       "transport": "streamable-http",
       "url": "https://mechreaper007x-clip-a-canvas-mcp.hf.space/mcp",
       "headers": {},
