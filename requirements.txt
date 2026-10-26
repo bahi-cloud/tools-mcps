@@ -31,3 +31,4 @@ faster-whisper   # تفريغ الصوت → نص (عربي)
 matplotlib       # رسوم بيانية للتقارير
 beautifulsoup4   # كشط ويب مكمّل لـ Firecrawl
 qrcode[pil]      # توليد رموز QR
+playwright
