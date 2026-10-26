@@ -1,7 +1,7 @@
 # tools.py
 # جميع الأدوات المحلية مع دعم اللغة العربية
-# ★ نسخة نهائية: قراءة كسولة لكل متغيرات البيئة + read_pdf حقيقية + composio_revoke_account
-# ★ إصلاح: دوال المستندات تقبل أسماء معاملات بديلة (لتفادي خطأ 400)
+# ★ نسخة نهائية: قراءة كسولة + read_pdf حقيقية + composio_revoke_account
+# ★ إصلاح: دعم filename في دوال إنشاء الملفات
 
 import os
 import io
@@ -15,9 +15,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from fastapi import Request
 
-# ══════════════════════════════════════════════════════════
-# استيرادات ReportLab
-# ══════════════════════════════════════════════════════════
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -27,11 +24,10 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 
 # ══════════════════════════════════════════════════════════
-# ★ قراءة متغيرات البيئة (كسولة — لا تُثبَّت وقت الاستيراد)
+# ★ قراءة متغيرات البيئة (كسولة)
 # ══════════════════════════════════════════════════════════
 
 def _env(*names: str, default: Optional[str] = None) -> Optional[str]:
-    """يقرأ أول متغير بيئة موجود من القائمة."""
     for name in names:
         val = os.environ.get(name)
         if val and val.strip():
@@ -48,14 +44,12 @@ _COMPOSIO_KEY_ALIASES = (
 
 
 def _get_composio_key(api_key: Optional[str] = None) -> Optional[str]:
-    """يرجع المفتاح من المعامل أو من متغيرات البيئة (بأي اسم)."""
     if api_key and str(api_key).strip():
         return str(api_key).strip()
     return _env(*_COMPOSIO_KEY_ALIASES)
 
 
 def _get_composio_base_url() -> str:
-    """يُقرأ في كل استدعاء — آمن لـ HuggingFace (لا يُثبَّت وقت الاستيراد)."""
     return _env(
         "COMPOSIO_BASE_URL",
         "COMPOSIO_API_URL",
@@ -64,12 +58,11 @@ def _get_composio_base_url() -> str:
 
 
 def _get_composio_default_user_id() -> str:
-    """يُقرأ في كل استدعاء."""
     return _env("COMPOSIO_USER_ID", default="default")
 
 
 # ══════════════════════════════════════════════════════════
-# دعم اللغة العربية في ملفات PDF
+# دعم اللغة العربية في PDF
 # ══════════════════════════════════════════════════════════
 BASE_DIR = Path(__file__).parent
 FONTS_DIR = BASE_DIR / "fonts"
@@ -83,7 +76,6 @@ _arabic_font_ready = False
 
 
 async def _ensure_arabic_font() -> None:
-    """تأكد من وجود الخط العربي، وحمله إذا لم يكن موجوداً."""
     global _arabic_font_ready
     try:
         if not ARABIC_FONT_PATH.exists():
@@ -100,7 +92,6 @@ async def _ensure_arabic_font() -> None:
 
 
 def _shape_text(text: str) -> str:
-    """إعادة تشكيل النص العربي للعرض الصحيح في PDF."""
     try:
         import arabic_reshaper
         from bidi.algorithm import get_display
@@ -130,7 +121,7 @@ class LocalTool:
 
 
 # ══════════════════════════════════════════════════════════
-# 2. Decorator للتسجيل
+# 2. Decorator
 # ══════════════════════════════════════════════════════════
 TOOLS: Dict[str, LocalTool] = {}
 
@@ -183,28 +174,56 @@ def _apply_markdown_lines(add_heading, add_paragraph, add_bullet, text: str):
             add_paragraph(line)
 
 
+def _pick_content(*values) -> str:
+    for v in values:
+        if v and isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+
+def _safe_filename(name: str, default_ext: str) -> str:
+    """ينظف اسم الملف ويضمن الامتداد الصحيح."""
+    if not name or not name.strip():
+        return ""
+    safe = "".join(c for c in name.strip() if c.isalnum() or c in "-_.")[:60]
+    if not safe:
+        return ""
+    if not safe.lower().endswith("." + default_ext):
+        safe += "." + default_ext
+    return safe
+
+
 def _save_bytes_and_url(
     data: bytes, ext: str,
     request: Optional[Request],
     files_dir: Optional[Path],
+    filename: str = "",
 ) -> dict:
-    """دالة موحدة لحفظ الملفات وإرجاع الرابط."""
+    """دالة موحدة لحفظ الملفات. تدعم filename المخصص."""
     if files_dir is None:
         files_dir = Path.cwd() / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
-    path = files_dir / filename
-    path.write_bytes(data)
+
+    safe = _safe_filename(filename, ext)
+    if safe:
+        path = files_dir / safe
+        path.write_bytes(data)
+        fname = safe
+    else:
+        fname = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
+        path = files_dir / fname
+        path.write_bytes(data)
+
     if request:
         base_url = str(request.base_url).rstrip("/")
-        file_url = f"{base_url}/files/{filename}"
+        file_url = f"{base_url}/files/{fname}"
     else:
-        file_url = f"/files/{filename}"
+        file_url = f"/files/{fname}"
     return {"local_path": str(path), "file_url": file_url}
 
 
 # ══════════════════════════════════════════════════════════
-# 4. أدوات Firecrawl
+# 4. Firecrawl
 # ══════════════════════════════════════════════════════════
 @tool(
     name="firecrawl_search",
@@ -229,10 +248,7 @@ async def firecrawl_search(query: str, limit: int = 5, api_key: Optional[str] = 
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.post(
             "https://api.firecrawl.dev/v1/search",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={"query": query, "limit": limit},
         )
         if r.status_code != 200:
@@ -274,10 +290,7 @@ async def firecrawl_scrape(url: str, api_key: Optional[str] = None) -> dict:
     async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
         r = await client.post(
             "https://api.firecrawl.dev/v1/scrape",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={"url": url, "formats": ["markdown"], "onlyMainContent": True},
         )
         if r.status_code != 200:
@@ -293,7 +306,7 @@ async def firecrawl_scrape(url: str, api_key: Optional[str] = None) -> dict:
 
 
 # ══════════════════════════════════════════════════════════
-# 5. أدوات Context7
+# 5. Context7
 # ══════════════════════════════════════════════════════════
 @tool(
     name="context7_resolve_library",
@@ -360,10 +373,7 @@ async def context7_get_docs(library_id: str, api_key: Optional[str] = None, topi
         r = await client.get(
             "https://context7.com/api/v2/context",
             params=params,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "X-Context7-Source": "mcp-server",
-            },
+            headers={"Authorization": f"Bearer {api_key}", "X-Context7-Source": "mcp-server"},
         )
         if r.status_code != 200:
             return {"error": f"Context7 API error ({r.status_code}): {r.text[:500]}"}
@@ -373,7 +383,7 @@ async def context7_get_docs(library_id: str, api_key: Optional[str] = None, topi
 
 
 # ══════════════════════════════════════════════════════════
-# 6. أدوات Composio (قراءة كسولة + revoke)
+# 6. Composio
 # ══════════════════════════════════════════════════════════
 
 @tool(
@@ -433,11 +443,7 @@ async def composio_list_tools(toolkit_slug: str, api_key: Optional[str] = None, 
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.get(
             f"{_get_composio_base_url()}/tools",
-            params={
-                "toolkit_slug": toolkit_slug,
-                "toolkit_versions": "latest",
-                "limit": limit,
-            },
+            params={"toolkit_slug": toolkit_slug, "toolkit_versions": "latest", "limit": limit},
             headers={"x-api-key": api_key},
         )
         if r.status_code == 401:
@@ -554,16 +560,8 @@ async def composio_revoke_account(connected_account_id: str, api_key: Optional[s
 
 
 # ══════════════════════════════════════════════════════════
-# 7. أدوات المستندات (مع دعم العربية + معاملات مرنة)
+# 7. أدوات المستندات (معاملات مرنة + filename)
 # ══════════════════════════════════════════════════════════
-
-def _pick_content(*values) -> str:
-    """يرجع أول قيمة نصية غير فارغة من القيم المعطاة."""
-    for v in values:
-        if v and isinstance(v, str) and v.strip():
-            return v
-    return ""
-
 
 @tool(
     name="create_docx",
@@ -573,6 +571,7 @@ def _pick_content(*values) -> str:
         "properties": {
             "title": {"type": "string", "description": "عنوان المستند"},
             "content_markdown": {"type": "string", "description": "محتوى المستند بصيغة Markdown"},
+            "filename": {"type": "string", "description": "اسم الملف (اختياري)"},
         },
         "required": ["title", "content_markdown"],
     },
@@ -586,6 +585,7 @@ def create_docx(
     content: str = "",
     text: str = "",
     markdown: str = "",
+    filename: str = "",
     request: Optional[Request] = None,
     files_dir: Optional[Path] = None,
 ) -> dict:
@@ -593,9 +593,7 @@ def create_docx(
 
     final_content = _pick_content(content_markdown, content, text, markdown)
     if not final_content:
-        raise ValueError(
-            "المعامل 'content_markdown' (أو 'content' / 'text' / 'markdown') مطلوب لإنشاء DOCX."
-        )
+        raise ValueError("المعامل 'content_markdown' مطلوب لإنشاء DOCX.")
 
     doc = Document()
     doc.add_heading(title, level=1)
@@ -607,7 +605,7 @@ def create_docx(
     )
     buf = io.BytesIO()
     doc.save(buf)
-    return _save_bytes_and_url(buf.getvalue(), "docx", request, files_dir)
+    return _save_bytes_and_url(buf.getvalue(), "docx", request, files_dir, filename)
 
 
 @tool(
@@ -628,6 +626,7 @@ def create_docx(
                     },
                 },
             },
+            "filename": {"type": "string", "description": "اسم الملف (اختياري)"},
         },
         "required": ["title", "slides"],
     },
@@ -640,18 +639,17 @@ def create_pptx(
     slides: Optional[List[Dict[str, Any]]] = None,
     content: Optional[List[Dict[str, Any]]] = None,
     content_markdown: str = "",
+    filename: str = "",
     request: Optional[Request] = None,
     files_dir: Optional[Path] = None,
 ) -> dict:
     from pptx import Presentation
 
-    # ★ مرونة: قد يرسل الوكيل slides أو content (كقائمة) أو content_markdown (كنص)
     final_slides = slides or content
     if final_slides is None and content_markdown:
-        # إذا أرسل نصاً فقط، نحوّله إلى شريحة واحدة
         final_slides = [{"title": title, "bullets": [content_markdown]}]
     if not final_slides:
-        raise ValueError("المعامل 'slides' (أو 'content' كقائمة) مطلوب لإنشاء PPTX.")
+        raise ValueError("المعامل 'slides' مطلوب لإنشاء PPTX.")
 
     prs = Presentation()
     title_slide = prs.slides.add_slide(prs.slide_layouts[0])
@@ -667,7 +665,7 @@ def create_pptx(
             p.text = b
     buf = io.BytesIO()
     prs.save(buf)
-    return _save_bytes_and_url(buf.getvalue(), "pptx", request, files_dir)
+    return _save_bytes_and_url(buf.getvalue(), "pptx", request, files_dir, filename)
 
 
 @tool(
@@ -678,6 +676,7 @@ def create_pptx(
         "properties": {
             "title": {"type": "string", "description": "عنوان المستند"},
             "content_markdown": {"type": "string", "description": "محتوى المستند بصيغة Markdown"},
+            "filename": {"type": "string", "description": "اسم الملف (اختياري)"},
         },
         "required": ["title", "content_markdown"],
     },
@@ -691,14 +690,13 @@ def create_pdf(
     content: str = "",
     text: str = "",
     markdown: str = "",
+    filename: str = "",
     request: Optional[Request] = None,
     files_dir: Optional[Path] = None,
 ) -> dict:
     final_content = _pick_content(content_markdown, content, text, markdown)
     if not final_content:
-        raise ValueError(
-            "المعامل 'content_markdown' (أو 'content' / 'text' / 'markdown') مطلوب لإنشاء PDF."
-        )
+        raise ValueError("المعامل 'content_markdown' مطلوب لإنشاء PDF.")
 
     try:
         loop = asyncio.get_event_loop()
@@ -735,7 +733,7 @@ def create_pdf(
 
     _apply_markdown_lines(add_heading, add_paragraph, add_bullet, final_content)
     doc.build(story)
-    return _save_bytes_and_url(buf.getvalue(), "pdf", request, files_dir)
+    return _save_bytes_and_url(buf.getvalue(), "pdf", request, files_dir, filename)
 
 
 @tool(
@@ -754,11 +752,10 @@ def create_pdf(
     tags=["document", "pdf"],
 )
 async def read_pdf(url: Optional[str] = None, base64_data: Optional[str] = None, max_pages: int = 20) -> dict:
-    """قراءة ملف PDF فعلياً من URL أو base64."""
     try:
         import pdfplumber
     except ImportError:
-        return {"error": "مكتبة pdfplumber غير مثبتة. أضفها إلى requirements.txt"}
+        return {"error": "مكتبة pdfplumber غير مثبتة."}
 
     if base64_data:
         try:
@@ -808,6 +805,7 @@ async def read_pdf(url: Optional[str] = None, base64_data: Optional[str] = None,
             "title": {"type": "string", "description": "اسم الورقة"},
             "headers": {"type": "array", "items": {"type": "string"}},
             "rows": {"type": "array", "items": {"type": "array"}},
+            "filename": {"type": "string", "description": "اسم الملف (اختياري)"},
         },
         "required": ["title"],
     },
@@ -815,7 +813,14 @@ async def read_pdf(url: Optional[str] = None, base64_data: Optional[str] = None,
     aliases=["xlsx", "make_xlsx"],
     tags=["document", "excel"],
 )
-def create_xlsx(title: str, headers: Optional[List[str]] = None, rows: Optional[List[List[Any]]] = None, request: Optional[Request] = None, files_dir: Optional[Path] = None) -> dict:
+def create_xlsx(
+    title: str,
+    headers: Optional[List[str]] = None,
+    rows: Optional[List[List[Any]]] = None,
+    filename: str = "",
+    request: Optional[Request] = None,
+    files_dir: Optional[Path] = None,
+) -> dict:
     import openpyxl
 
     wb = openpyxl.Workbook()
@@ -827,7 +832,7 @@ def create_xlsx(title: str, headers: Optional[List[str]] = None, rows: Optional[
         ws.append(row)
     buf = io.BytesIO()
     wb.save(buf)
-    return _save_bytes_and_url(buf.getvalue(), "xlsx", request, files_dir)
+    return _save_bytes_and_url(buf.getvalue(), "xlsx", request, files_dir, filename)
 
 
 @tool(
@@ -846,7 +851,7 @@ def markdown_to_html(markdown_text: str = "", text: str = "", content: str = "")
     import markdown as md
     final_text = _pick_content(markdown_text, text, content)
     if not final_text:
-        raise ValueError("المعامل 'markdown_text' (أو 'text' / 'content') مطلوب.")
+        raise ValueError("المعامل 'markdown_text' مطلوب.")
     html = md.markdown(final_text, extensions=["tables", "fenced_code"])
     return {"html": html}
 
@@ -863,13 +868,21 @@ def markdown_to_html(markdown_text: str = "", text: str = "", content: str = "")
             "url": {"type": "string", "description": "رابط الملف"},
             "base64_data": {"type": "string", "description": "بيانات الملف مشفرة بـ base64"},
             "ext": {"type": "string", "description": "امتداد الملف", "default": "mp4"},
+            "filename": {"type": "string", "description": "اسم الملف (اختياري)"},
         },
     },
     category="Media",
     aliases=["download_media"],
     tags=["media", "file"],
 )
-async def fetch_media_to_file(url: Optional[str] = None, base64_data: Optional[str] = None, ext: str = "mp4", request: Optional[Request] = None, files_dir: Optional[Path] = None) -> dict:
+async def fetch_media_to_file(
+    url: Optional[str] = None,
+    base64_data: Optional[str] = None,
+    ext: str = "mp4",
+    filename: str = "",
+    request: Optional[Request] = None,
+    files_dir: Optional[Path] = None,
+) -> dict:
     if base64_data:
         data = base64.b64decode(base64_data)
     elif url:
@@ -880,7 +893,7 @@ async def fetch_media_to_file(url: Optional[str] = None, base64_data: Optional[s
     else:
         return {"error": "يجب توفير url أو base64_data"}
 
-    return _save_bytes_and_url(data, ext, request, files_dir)
+    return _save_bytes_and_url(data, ext, request, files_dir, filename)
 
 
 @tool(
@@ -891,6 +904,7 @@ async def fetch_media_to_file(url: Optional[str] = None, base64_data: Optional[s
         "properties": {
             "content": {"type": "string", "description": "المحتوى النصي"},
             "ext": {"type": "string", "description": "امتداد الملف", "default": "txt"},
+            "filename": {"type": "string", "description": "اسم الملف (اختياري)"},
         },
         "required": ["content"],
     },
@@ -903,17 +917,18 @@ def write_text_file(
     text: str = "",
     data: str = "",
     ext: str = "txt",
+    filename: str = "",
     request: Optional[Request] = None,
     files_dir: Optional[Path] = None,
 ) -> dict:
     final_content = _pick_content(content, text, data)
     if not final_content:
-        raise ValueError("المعامل 'content' (أو 'text' / 'data') مطلوب.")
-    return _save_bytes_and_url(final_content.encode("utf-8"), ext, request, files_dir)
+        raise ValueError("المعامل 'content' مطلوب.")
+    return _save_bytes_and_url(final_content.encode("utf-8"), ext, request, files_dir, filename)
 
 
 # ══════════════════════════════════════════════════════════
-# 9. أداة Ping
+# 9. Ping
 # ══════════════════════════════════════════════════════════
 @tool(
     name="ping",
