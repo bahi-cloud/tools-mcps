@@ -2,6 +2,7 @@
 # + إصلاح user_id + إزالة تكرار الأدوات + الوكيل الخارق
 # + عزل المستخدمين في /call + composio_revoke_account + /composio/disconnect
 # + قراءة كسولة لـ COMPOSIO_API_KEY و COMPOSIO_DEFAULT_USER_ID
+# + revoke_account على v3.1 مع revoke_on_delete=true (الحل النهائي)
 import os
 import io
 import json
@@ -326,7 +327,7 @@ async def lifespan(app: FastAPI):
     await registry.shutdown()
 
 
-app = FastAPI(title="9Router Tools Server", version="1.0.3", lifespan=lifespan)
+app = FastAPI(title="9Router Tools Server", version="1.0.4", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -808,41 +809,63 @@ async def composio_close_session(session_id: str) -> dict:
         return r.json() if r.content else {"ok": True, "closed": session_id}
 
 
-# ★ ★ ★ NEW: composio_revoke_account (تسجيل الخروج الفعلي) ★ ★ ★
+# ★ ★ ★ NEW: composio_revoke_account (تسجيل الخروج الفعلي — v3.1 + DELETE) ★ ★ ★
 async def composio_revoke_account(connected_account_id: str) -> dict:
     """
-    ✅ تسجيل الخروج الفعلي من تطبيق Composio.
-    يلغي التفويض ويُبقي السجل قابلاً للاستعادة لاحقاً.
-    ⚠️ استدعِ composio_list_connected_tools أولاً للحصول على 'id' الصحيح.
+    ✅ تسجيل خروج فعلي: حذف الحساب من Composio وإلغاء التوثيق.
+    يستخدم v3.1 مع revoke_on_delete=true.
     """
     api_key = _get_composio_api_key()
     if not api_key:
-        return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
+        return {"ok": False, "error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
 
-    if not connected_account_id or not connected_account_id.strip():
-        return {
-            "error": "المعامل 'connected_account_id' مطلوب.",
-            "suggestion": "استدعِ composio_list_connected_tools أولاً للحصول على 'id' الصحيح.",
-        }
+    cid = (connected_account_id or "").strip()
+    if not cid:
+        return {"ok": False, "error": "connected_account_id مطلوب"}
+
+    url = f"{COMPOSIO_BASE_URL_V31}/connected_accounts/{cid}?revoke_on_delete=true"
+    headers = {"x-api-key": api_key}
 
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        r = await client.post(
-            f"{COMPOSIO_BASE_URL}/connected_accounts/{connected_account_id}/revoke",
-            headers={"x-api-key": api_key},
-        )
-
-    if r.status_code == 404:
-        return {
-            "error": f"الحساب '{connected_account_id}' غير موجود.",
-            "status_code": 404,
-            "suggestion": "تحقق من الـ id عبر composio_list_connected_tools.",
+        r = await client.delete(url, headers=headers)
+        info = {
+            "upstream_status": r.status_code,
+            "upstream_body": r.text[:300],
+            "url": url,
         }
-    if r.status_code == 401:
-        return {"error": "مفتاح Composio API غير صالح."}
-    if r.status_code not in (200, 201, 204):
-        return {"error": f"Composio API error ({r.status_code}): {r.text[:500]}"}
+        if r.status_code == 404:
+            return {"ok": True, "revoked": cid, "note": "already_deleted", **info}
+        if r.status_code not in (200, 204):
+            return {"ok": False, "error": f"Composio رفض الحذف ({r.status_code})", **info}
+        try:
+            body = r.json()
+            success = r.status_code == 204 or body.get("success") is True
+        except Exception:
+            success = r.status_code == 204
+        if not success:
+            return {"ok": False, "error": "رد غير متوقع من Composio", **info}
 
-    return {"ok": True, "revoked": connected_account_id}
+        status_after = "UNKNOWN"
+        try:
+            g = await client.get(
+                f"{COMPOSIO_BASE_URL_V31}/connected_accounts/{cid}",
+                headers=headers,
+            )
+            if g.status_code == 404:
+                status_after = "DELETED"
+            elif g.status_code == 200:
+                status_after = str(g.json().get("status", "")).upper()
+        except Exception:
+            pass
+
+    if status_after == "ACTIVE":
+        return {
+            "ok": False,
+            "error": "حُذف لكن الحساب ما زال ACTIVE — revoke_on_delete يعمل في الخلفية",
+            "status_after": status_after,
+            **info,
+        }
+    return {"ok": True, "revoked": cid, "status_after": status_after, **info}
 
 
 # ══════════════════════════════════════════════════════════
