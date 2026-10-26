@@ -1,6 +1,7 @@
 # tools.py
 # جميع الأدوات المحلية مع دعم اللغة العربية
 # ★ نسخة نهائية: قراءة كسولة لكل متغيرات البيئة + read_pdf حقيقية + composio_revoke_account
+# ★ إصلاح: دوال المستندات تقبل أسماء معاملات بديلة (لتفادي خطأ 400)
 
 import os
 import io
@@ -553,8 +554,17 @@ async def composio_revoke_account(connected_account_id: str, api_key: Optional[s
 
 
 # ══════════════════════════════════════════════════════════
-# 7. أدوات المستندات (مع دعم العربية)
+# 7. أدوات المستندات (مع دعم العربية + معاملات مرنة)
 # ══════════════════════════════════════════════════════════
+
+def _pick_content(*values) -> str:
+    """يرجع أول قيمة نصية غير فارغة من القيم المعطاة."""
+    for v in values:
+        if v and isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+
 @tool(
     name="create_docx",
     description="إنشاء ملف Word (.docx).",
@@ -570,8 +580,22 @@ async def composio_revoke_account(connected_account_id: str, api_key: Optional[s
     aliases=["docx", "make_docx"],
     tags=["document", "word"],
 )
-def create_docx(title: str, content_markdown: str, request: Optional[Request] = None, files_dir: Optional[Path] = None) -> dict:
+def create_docx(
+    title: str,
+    content_markdown: str = "",
+    content: str = "",
+    text: str = "",
+    markdown: str = "",
+    request: Optional[Request] = None,
+    files_dir: Optional[Path] = None,
+) -> dict:
     from docx import Document
+
+    final_content = _pick_content(content_markdown, content, text, markdown)
+    if not final_content:
+        raise ValueError(
+            "المعامل 'content_markdown' (أو 'content' / 'text' / 'markdown') مطلوب لإنشاء DOCX."
+        )
 
     doc = Document()
     doc.add_heading(title, level=1)
@@ -579,7 +603,7 @@ def create_docx(title: str, content_markdown: str, request: Optional[Request] = 
         lambda t, lvl: doc.add_heading(t, level=lvl),
         lambda t: doc.add_paragraph(t),
         lambda t: doc.add_paragraph(t, style="List Bullet"),
-        content_markdown,
+        final_content,
     )
     buf = io.BytesIO()
     doc.save(buf)
@@ -611,14 +635,29 @@ def create_docx(title: str, content_markdown: str, request: Optional[Request] = 
     aliases=["pptx", "make_pptx"],
     tags=["document", "presentation"],
 )
-def create_pptx(title: str, slides: List[Dict[str, Any]], request: Optional[Request] = None, files_dir: Optional[Path] = None) -> dict:
+def create_pptx(
+    title: str,
+    slides: Optional[List[Dict[str, Any]]] = None,
+    content: Optional[List[Dict[str, Any]]] = None,
+    content_markdown: str = "",
+    request: Optional[Request] = None,
+    files_dir: Optional[Path] = None,
+) -> dict:
     from pptx import Presentation
+
+    # ★ مرونة: قد يرسل الوكيل slides أو content (كقائمة) أو content_markdown (كنص)
+    final_slides = slides or content
+    if final_slides is None and content_markdown:
+        # إذا أرسل نصاً فقط، نحوّله إلى شريحة واحدة
+        final_slides = [{"title": title, "bullets": [content_markdown]}]
+    if not final_slides:
+        raise ValueError("المعامل 'slides' (أو 'content' كقائمة) مطلوب لإنشاء PPTX.")
 
     prs = Presentation()
     title_slide = prs.slides.add_slide(prs.slide_layouts[0])
     title_slide.shapes.title.text = title
     bullet_layout = prs.slide_layouts[1]
-    for s in slides:
+    for s in final_slides:
         slide = prs.slides.add_slide(bullet_layout)
         slide.shapes.title.text = s.get("title", "")
         tf = slide.placeholders[1].text_frame
@@ -646,7 +685,21 @@ def create_pptx(title: str, slides: List[Dict[str, Any]], request: Optional[Requ
     aliases=["pdf", "make_pdf"],
     tags=["document", "pdf", "arabic"],
 )
-def create_pdf(title: str, content_markdown: str, request: Optional[Request] = None, files_dir: Optional[Path] = None) -> dict:
+def create_pdf(
+    title: str,
+    content_markdown: str = "",
+    content: str = "",
+    text: str = "",
+    markdown: str = "",
+    request: Optional[Request] = None,
+    files_dir: Optional[Path] = None,
+) -> dict:
+    final_content = _pick_content(content_markdown, content, text, markdown)
+    if not final_content:
+        raise ValueError(
+            "المعامل 'content_markdown' (أو 'content' / 'text' / 'markdown') مطلوب لإنشاء PDF."
+        )
+
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
@@ -680,7 +733,7 @@ def create_pdf(title: str, content_markdown: str, request: Optional[Request] = N
     def add_bullet(text):
         story.append(Paragraph(_shape_text("• " + text), styles["Normal"]))
 
-    _apply_markdown_lines(add_heading, add_paragraph, add_bullet, content_markdown)
+    _apply_markdown_lines(add_heading, add_paragraph, add_bullet, final_content)
     doc.build(story)
     return _save_bytes_and_url(buf.getvalue(), "pdf", request, files_dir)
 
@@ -707,7 +760,6 @@ async def read_pdf(url: Optional[str] = None, base64_data: Optional[str] = None,
     except ImportError:
         return {"error": "مكتبة pdfplumber غير مثبتة. أضفها إلى requirements.txt"}
 
-    # 1) جلب البيانات
     if base64_data:
         try:
             data = base64.b64decode(base64_data)
@@ -724,7 +776,6 @@ async def read_pdf(url: Optional[str] = None, base64_data: Optional[str] = None,
     else:
         return {"error": "يجب توفير url أو base64_data"}
 
-    # 2) استخراج النص
     try:
         text_parts: List[str] = []
         pages_read = 0
@@ -791,9 +842,12 @@ def create_xlsx(title: str, headers: Optional[List[str]] = None, rows: Optional[
     aliases=["md_to_html"],
     tags=["document", "markdown", "html"],
 )
-def markdown_to_html(markdown_text: str) -> dict:
+def markdown_to_html(markdown_text: str = "", text: str = "", content: str = "") -> dict:
     import markdown as md
-    html = md.markdown(markdown_text, extensions=["tables", "fenced_code"])
+    final_text = _pick_content(markdown_text, text, content)
+    if not final_text:
+        raise ValueError("المعامل 'markdown_text' (أو 'text' / 'content') مطلوب.")
+    html = md.markdown(final_text, extensions=["tables", "fenced_code"])
     return {"html": html}
 
 
@@ -844,9 +898,18 @@ async def fetch_media_to_file(url: Optional[str] = None, base64_data: Optional[s
     aliases=["write_file"],
     tags=["file", "text"],
 )
-def write_text_file(content: str, ext: str = "txt", request: Optional[Request] = None, files_dir: Optional[Path] = None) -> dict:
-    data = content.encode("utf-8")
-    return _save_bytes_and_url(data, ext, request, files_dir)
+def write_text_file(
+    content: str = "",
+    text: str = "",
+    data: str = "",
+    ext: str = "txt",
+    request: Optional[Request] = None,
+    files_dir: Optional[Path] = None,
+) -> dict:
+    final_content = _pick_content(content, text, data)
+    if not final_content:
+        raise ValueError("المعامل 'content' (أو 'text' / 'data') مطلوب.")
+    return _save_bytes_and_url(final_content.encode("utf-8"), ext, request, files_dir)
 
 
 # ══════════════════════════════════════════════════════════
