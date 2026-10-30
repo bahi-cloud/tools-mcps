@@ -4,6 +4,11 @@
 # + قراءة كسولة لـ COMPOSIO_API_KEY و COMPOSIO_DEFAULT_USER_ID
 # + revoke_account على v3.1 مع revoke_on_delete=true (الحل النهائي)
 # + عزل الملفات لكل مستخدم (client_id) + روابط كاملة للملفات
+# ★ FIX (هذه النسخة): /call لم يعد يعلّق التطبيق
+#     1) الدوال المتزامنة تعمل في thread بدل الـ event loop
+#     2) مهلة زمنية CALL_TIMEOUT لكل استدعاء (504 بدل التعليق)
+#     3) _is_url_safe (DNS متزامن) يعمل في thread
+#     4) إزالة طباعة قائمة المسارات الكاملة في كل استدعاء
 import os
 import io
 import json
@@ -99,6 +104,12 @@ COMPOSIO_BASE_URL_V31 = "https://backend.composio.dev/api/v3.1"
 APP_SECRET = os.environ.get("APP_SECRET", "")
 SPACE_BASE_URL = os.environ.get("SPACE_BASE_URL", "")
 
+# ★ FIX: المهلة القصوى (بالثواني) لأي استدعاء في /call — قابلة للتعديل من متغير بيئة
+try:
+    CALL_TIMEOUT = int(os.environ.get("CALL_TIMEOUT", "120"))
+except ValueError:
+    CALL_TIMEOUT = 120
+
 
 # ══════════════════════════════════════════════════════════
 # ★ قراءة كسولة لمتغيرات Composio الحساسة (آمنة لـ HuggingFace)
@@ -135,17 +146,17 @@ def save_bytes(data: bytes, ext: str, client_id: str = None) -> str:
     """
     if client_id is None:
         client_id = _current_client_id.get()
-    
+
     # تنظيف client_id لمنع أي محاولة اختراق مسار (Path Traversal)
     safe_client = "".join(c for c in client_id if c.isalnum() or c in "-_")[:32] or "anonymous"
-    
+
     # إنشاء مجلد المستخدم إذا لم يكن موجوداً
     user_dir = FILES_DIR / safe_client
     user_dir.mkdir(parents=True, exist_ok=True)
-    
+
     filename = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
     (user_dir / filename).write_bytes(data)
-    
+
     return f"/files/{safe_client}/{filename}"
 
 
@@ -443,7 +454,8 @@ async def _download(url: Optional[str], base64_data: Optional[str]) -> bytes:
     if base64_data:
         return base64.b64decode(base64_data)
     if url:
-        if not _is_url_safe(url):
+        # ★ FIX: getaddrinfo متزامن (قد يعلق على DNS) → ننفذه في thread
+        if not await asyncio.to_thread(_is_url_safe, url):
             raise ValueError("الرابط غير آمن أو محظور (حماية SSRF)")
         async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
             r = await client.get(url)
@@ -1307,6 +1319,17 @@ def _check_auth(x_api_key: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════
+# ★ FIX: غلاف المهلة الزمنية لاستدعاءات /call
+# ══════════════════════════════════════════════════════════
+async def _run(coro, tool: str):
+    """ينفّذ coroutine بمهلة CALL_TIMEOUT ويحوّل التعليق إلى 504 واضح."""
+    try:
+        return await asyncio.wait_for(coro, timeout=CALL_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise HTTPException(504, f"الأداة {tool} تجاوزت المهلة ({CALL_TIMEOUT} ثانية)")
+
+
+# ══════════════════════════════════════════════════════════
 # Endpoints
 # ══════════════════════════════════════════════════════════
 @app.get("/")
@@ -1329,6 +1352,7 @@ async def health():
         "super_agent_enabled": is_super_agent_enabled(),
         "files_isolation": True,
         "space_base_url_set": bool(SPACE_BASE_URL),
+        "call_timeout_seconds": CALL_TIMEOUT,
     }
 
 
@@ -1476,7 +1500,7 @@ async def upload_file(
             f"امتداد الملف '{orig_ext or '(بدون امتداد)'}' غير مسموح. "
             f"المسموحة: {', '.join(sorted(ALLOWED_UPLOAD_EXTS))}",
         )
-    
+
     # ★ عزل الملفات بحسب client_id
     cid = x_client_id.strip() or (
         hashlib.sha256(x_api_key.encode()).hexdigest()[:16] if x_api_key else "anonymous"
@@ -1484,7 +1508,7 @@ async def upload_file(
     safe_client = "".join(c for c in cid if c.isalnum() or c in "-_")[:32] or "anonymous"
     user_dir = FILES_DIR / safe_client
     user_dir.mkdir(parents=True, exist_ok=True)
-    
+
     filename = f"{uuid.uuid4().hex}{orig_ext}"
     dest = user_dir / filename
     size = 0
@@ -1510,7 +1534,7 @@ async def upload_file(
         raise HTTPException(500, f"فشل حفظ الملف: {e}")
     finally:
         await file.close()
-    
+
     rel = f"/files/{safe_client}/{filename}"
     return {
         "ok": True,
@@ -1562,8 +1586,11 @@ async def call_tool(
         if not video_session:
             raise HTTPException(503, "خادم أدوات الفيديو غير متصل")
         try:
-            result_text = await _call_video_tool(req.tool, req.arguments)
+            # ★ FIX: مهلة زمنية
+            result_text = await _run(_call_video_tool(req.tool, req.arguments), req.tool)
             return {"ok": True, "result": result_text}
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(500, f"خطأ في أداة الفيديو {req.tool}: {e}")
 
@@ -1572,10 +1599,14 @@ async def call_tool(
     if fn:
         try:
             if asyncio.iscoroutinefunction(fn):
-                result = await fn(**req.arguments)
+                result = await _run(fn(**req.arguments), req.tool)
             else:
-                result = fn(**req.arguments)
+                # ★ FIX: الدوال المتزامنة (pdf/docx/xlsx/...) في thread حتى لا تبلوكي الـ event loop
+                # (to_thread ينسخ contextvars، فعزل الملفات per-client يبقى يعمل)
+                result = await _run(asyncio.to_thread(fn, **req.arguments), req.tool)
             return {"ok": True, "result": result}
+        except HTTPException:
+            raise
         except ValueError as e:
             raise HTTPException(400, str(e))
         except TypeError as e:
@@ -1587,17 +1618,20 @@ async def call_tool(
             raise HTTPException(500, f"خطأ أثناء تنفيذ {req.tool}: {e}")
 
     # 3. أدوات Hub — مع عزل المستخدمين
+    # ★ FIX: لا نطبع قائمة المسارات الكاملة (250+ اسم) في كل استدعاء
     logger.info(f"Incoming tool = {req.tool}")
-    logger.info(f"Available routes = {list(registry.tool_routes.keys())}")
 
     if req.tool not in registry.tool_routes:
-        logger.warning(f"Tool '{req.tool}' not found. Available: {list(registry.tool_routes.keys())}")
+        logger.warning(f"Tool '{req.tool}' not found in hub routes")
 
     context = AccessContext(client_id=client_id)
 
     try:
-        result = await registry.call_tool(req.tool, req.arguments, context)
+        # ★ FIX: مهلة زمنية للأدوات الثقيلة (render / nmap / ...)
+        result = await _run(registry.call_tool(req.tool, req.arguments, context), req.tool)
         return {"ok": True, "result": result}
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = str(e)
         if "ToolNotFound" in error_msg or "not found" in error_msg.lower():
