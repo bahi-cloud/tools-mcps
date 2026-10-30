@@ -260,7 +260,7 @@
       "comment": "خادم HTML to Video مجاني (Clip.A.Canvas) مستضاف على HF Spaces."
     },
     "three-ws-studio": {
-      "enabled": true,
+      "enabled": false,
       "transport": "streamable-http",
       "url": "https://three.ws/api/mcp-studio",
       "timeout": 360,
