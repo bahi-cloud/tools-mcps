@@ -9,6 +9,7 @@
 #     2) مهلة زمنية CALL_TIMEOUT لكل استدعاء (504 بدل التعليق)
 #     3) _is_url_safe (DNS متزامن) يعمل في thread
 #     4) إزالة طباعة قائمة المسارات الكاملة في كل استدعاء
+#     5) الإقلاع الثقيل (video + hub + font) في الخلفية → المنفذ يفتح فوراً
 import os
 import io
 import json
@@ -366,20 +367,60 @@ def _shape_text(text: str) -> str:
 
 # ══════════════════════════════════════════════════════════
 # lifespan
+# ★ FIX: الإقلاع الثقيل (video-audio-mcp ≈ 28 ثانية + 15 سيرفر MCP + تحميل الخط)
+#   ينفَّذ في الخلفية. هكذا يفتح uvicorn المنفذ 7860 فوراً بدل أن يرفض الطلبات
+#   (timeout) طوال ~50 ثانية بعد كل إقلاع/restart.
+#   كل اتصالات MCP تُفتح وتُغلق داخل task واحد (متطلب anyio لـ stdio_client).
 # ══════════════════════════════════════════════════════════
+_hub_stop: Optional[asyncio.Event] = None
+_hub_task: Optional[asyncio.Task] = None
+_font_task: Optional[asyncio.Task] = None
+_hub_state: Dict[str, Any] = {"ready": False, "result": None}
+
+
+async def _background_startup() -> None:
+    try:
+        await _connect_video_mcp()
+        result = await registry.startup_from_config()
+        _hub_state["result"] = result
+        _hub_state["ready"] = True
+        logger.info(f"Hub startup result: {result}")
+        logger.info(f"Hub tools registered: {len(registry.tool_routes)}")
+        await _hub_stop.wait()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("فشل الإقلاع في الخلفية")
+    finally:
+        try:
+            await _disconnect_video_mcp()
+        except BaseException as e:
+            logger.warning(f"خطأ أثناء إغلاق الفيديو: {e!r}")
+        try:
+            await registry.shutdown()
+        except BaseException as e:
+            logger.warning(f"خطأ أثناء إغلاق الـ hub: {e!r}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _hub_stop, _hub_task, _font_task
     _load_super_agent_state()
-    await _connect_video_mcp()
     await auth.reload()
-    result = await registry.startup_from_config()
-    logger.info(f"Hub startup result: {result}")
-    logger.info(f"Registered routes: {list(registry.tool_routes.keys())}")
     logger.info(f"🔌 حالة الوكيل الخارق عند الإقلاع: enabled={_super_agent_enabled}")
-    await _ensure_arabic_font()
-    yield
-    await _disconnect_video_mcp()
-    await registry.shutdown()
+
+    _hub_stop = asyncio.Event()
+    _hub_task = asyncio.create_task(_background_startup())
+    _font_task = asyncio.create_task(_ensure_arabic_font())
+
+    yield  # ← التطبيق يستقبل الطلبات هنا مباشرة
+
+    _hub_stop.set()
+    _, pending = await asyncio.wait({_hub_task}, timeout=20)
+    if pending:
+        _hub_task.cancel()
+    if _font_task and not _font_task.done():
+        _font_task.cancel()
 
 
 app = FastAPI(title="9Router Tools Server", version="1.0.5", lifespan=lifespan)
@@ -1347,7 +1388,8 @@ async def health():
         "auth_enforced": bool(APP_SECRET),
         "video_mcp_connected": bool(video_session),
         "video_tools_count": len(video_tool_names),
-        "hub_ready": True,
+        "hub_ready": _hub_state["ready"],
+        "hub_startup_errors": (_hub_state.get("result") or {}).get("errors", {}),
         "hub_servers": len(registry.servers) if hasattr(registry, 'servers') else 0,
         "super_agent_enabled": is_super_agent_enabled(),
         "files_isolation": True,
