@@ -1,6 +1,11 @@
 # hub.py
 # مدير الأدوات الموحد (MCP + Local) مع Circuit Breaker محسّن ومعالجة متقدمة
 # ★ إصدار جراحي: دعم ${ENV_VAR} في headers و env + عزل مستخدمين فعلي
+# ★ FIX (هذه النسخة): الإقلاع لا يمكن أن يعلق بسبب سيرفر MCP واحد
+#     1) مهلة startup_timeout لكل سيرفر (افتراضي 60 ثانية) عبر asyncio.timeout
+#     2) تنظيف الاتصال عند الإلغاء/المهلة (BaseException) حتى لا تبقى processes يتيمة
+#     3) إغلاق جلسة السيرفر الفاشل بدل تركها مفتوحة
+#     (لا تغيير في منطق الأدوات أو Circuit Breaker أو عزل المستخدمين)
 
 import json
 import logging
@@ -23,6 +28,9 @@ from tools import TOOLS as COMPOSIO_TOOLS, LocalTool
 from dependency_injector import DependencyInjector
 
 logger = logging.getLogger("hub")
+
+# ★ المهلة الافتراضية لإقلاع كل سيرفر MCP (اتصال + list_tools)
+DEFAULT_STARTUP_TIMEOUT = float(os.environ.get("MCP_STARTUP_TIMEOUT", "60"))
 
 
 # ══════════════════════════════════════════════════════════
@@ -205,10 +213,16 @@ class MCPSession:
             logger.info(f"✅ Connected to MCP server: {transport}")
             return self.session
 
-        except Exception as e:
+        except BaseException:
+            # ★ FIX: BaseException (وليس Exception فقط) ليشمل الإلغاء/المهلة
+            #   فلا تبقى processes أو اتصالات يتيمة
             if self.exit_stack:
-                await self.exit_stack.aclose()
+                try:
+                    await self.exit_stack.aclose()
+                except BaseException as close_err:
+                    logger.warning(f"Error cleaning up failed connection: {close_err!r}")
                 self.exit_stack = None
+            self.session = None
             raise
 
     async def list_tools(self) -> List[Any]:
@@ -226,8 +240,8 @@ class MCPSession:
         if self.exit_stack:
             try:
                 await self.exit_stack.aclose()
-            except Exception as e:
-                logger.warning(f"Error closing session: {e}")
+            except BaseException as e:
+                logger.warning(f"Error closing session: {e!r}")
             finally:
                 self.session = None
                 self.exit_stack = None
@@ -349,12 +363,22 @@ class MCPRegistry:
         for name, server_config in config.get("servers", {}).items():
             if not server_config.get("enabled", True):
                 continue
+
+            # ★ FIX: مهلة لكل سيرفر (قابلة للتعديل per-server بالمفتاح startup_timeout في mcps.json)
+            try:
+                startup_timeout = float(server_config.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT))
+            except (TypeError, ValueError):
+                startup_timeout = DEFAULT_STARTUP_TIMEOUT
+
+            session: Optional[MCPSession] = None
             try:
                 session = MCPSession(server_config)
-                await session.connect()
-                self.mcp_sessions[name] = session
+                # asyncio.timeout (Python 3.11+) يعمل في نفس الـ task، فلا يكسر cancel scopes الخاصة بـ anyio
+                async with asyncio.timeout(startup_timeout):
+                    await session.connect()
+                    tools = await session.list_tools()
 
-                tools = await session.list_tools()
+                self.mcp_sessions[name] = session
                 prefix = server_config.get("tool_prefix", name)
 
                 for tool in tools:
@@ -377,14 +401,21 @@ class MCPRegistry:
                 started.append(name)
                 logger.info(f"✅ Started server '{name}' with {len(tools)} tools")
 
+            except TimeoutError:
+                errors[name] = f"startup timeout after {startup_timeout}s"
+                logger.error(f"⏱️ Server '{name}' did not start within {startup_timeout}s — skipped")
+                if session is not None:
+                    await session.close()
             except Exception as e:
                 errors[name] = str(e)
                 logger.error(f"❌ Failed to start server '{name}': {e}")
+                if session is not None:
+                    await session.close()
 
         return {"started": started, "errors": errors}
 
     async def shutdown(self) -> None:
-        for name, session in self.mcp_sessions.items():
+        for name, session in list(self.mcp_sessions.items()):
             try:
                 await session.close()
                 logger.info(f"✅ Closed session for '{name}'")
