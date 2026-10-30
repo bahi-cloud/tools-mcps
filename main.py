@@ -1,5 +1,9 @@
-# main.py - التعديلات الجراحية النهائية لإصلاح مشكلة user_id + إزالة تكرار الأدوات
-# + إضافة خاصية "الوكيل الخارق" (Super Agent Switch) لتفعيل/تعطيل كل الأدوات دفعة واحدة
+# main.py - التعديلات الجراحية النهائية
+# + إصلاح user_id + إزالة تكرار الأدوات + الوكيل الخارق
+# + عزل المستخدمين في /call + composio_revoke_account + /composio/disconnect
+# + قراءة كسولة لـ COMPOSIO_API_KEY و COMPOSIO_DEFAULT_USER_ID
+# + revoke_account على v3.1 مع revoke_on_delete=true (الحل النهائي)
+# + عزل الملفات لكل مستخدم (client_id) + روابط كاملة للملفات
 import os
 import io
 import json
@@ -11,6 +15,8 @@ import asyncio
 import logging
 import traceback
 import shutil
+import hashlib
+import contextvars  # ★ NEW: لعزل الملفات
 from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -26,7 +32,14 @@ logger = logging.getLogger("main")
 logging.basicConfig(level=logging.INFO)
 
 # ══════════════════════════════════════════════════════════
-# استيراد Hub Core مع عرض الخطأ الحقيقي
+# ★ متغير سياق لعزل الملفات بين المستخدمين
+# ══════════════════════════════════════════════════════════
+_current_client_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_client_id", default="anonymous"
+)
+
+# ══════════════════════════════════════════════════════════
+# استيراد Hub Core
 # ══════════════════════════════════════════════════════════
 BASE_DIR = Path(__file__).parent
 
@@ -37,7 +50,7 @@ try:
 except Exception as e:
     logger.error(f"❌ فشل استيراد hub.py: {e}")
     traceback.print_exc()
-    
+
     class AccessContext:
         def __init__(self, client_id="internal", allowed_servers=None, allowed_domains=None, allowed_tags=None, allowed_tools=None):
             self.client_id = client_id
@@ -45,7 +58,7 @@ except Exception as e:
             self.allowed_domains = allowed_domains
             self.allowed_tags = allowed_tags
             self.allowed_tools = allowed_tools
-    
+
     class MockRegistry:
         async def startup_from_config(self):
             return {"started": [], "errors": {}}
@@ -59,11 +72,11 @@ except Exception as e:
         @property
         def tool_routes(self):
             return {}
-    
+
     class MockAuth:
         async def reload(self):
             pass
-    
+
     registry = MockRegistry()
     auth = MockAuth()
 
@@ -78,49 +91,101 @@ FILES_DIR.mkdir(exist_ok=True)
 
 FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY", "")
 CONTEXT7_API_KEY = os.environ.get("CONTEXT7_API_KEY", "")
-COMPOSIO_API_KEY = os.environ.get("COMPOSIO_API_KEY", "")
-COMPOSIO_DEFAULT_USER_ID = os.environ.get("COMPOSIO_DEFAULT_USER_ID", "default")
+
+# ★ COMPOSIO_BASE_URL ثابت (URL) — لا يحتاج قراءة كسولة
 COMPOSIO_BASE_URL = "https://backend.composio.dev/api/v3"
 COMPOSIO_BASE_URL_V31 = "https://backend.composio.dev/api/v3.1"
+
 APP_SECRET = os.environ.get("APP_SECRET", "")
 SPACE_BASE_URL = os.environ.get("SPACE_BASE_URL", "")
 
+
 # ══════════════════════════════════════════════════════════
-# ★ ★ ★ الوكيل الخارق (Super Agent Switch) ★ ★ ★
-# مفتاح واحد يفعّل أو يعطّل كل الأدوات دفعة واحدة (المضمّنة + أدوات الفيديو + أدوات Hub)
+# ★ قراءة كسولة لمتغيرات Composio الحساسة (آمنة لـ HuggingFace)
+# ══════════════════════════════════════════════════════════
+
+def _get_composio_api_key() -> str:
+    """★ تُقرأ في كل استدعاء — لا تُثبَّت وقت الاستيراد."""
+    return os.environ.get("COMPOSIO_API_KEY", "") or ""
+
+
+def _get_composio_default_user_id() -> str:
+    """★ تُقرأ في كل استدعاء — لا تُثبَّت وقت الاستيراد."""
+    return os.environ.get("COMPOSIO_DEFAULT_USER_ID", "default") or "default"
+
+
+# ══════════════════════════════════════════════════════════
+# ★ دوال عزل الملفات والروابط الكاملة
+# ══════════════════════════════════════════════════════════
+
+def _full_file_url(relative_path: str) -> str:
+    """★ يحول المسار النسبي إلى رابط كامل باستخدام SPACE_BASE_URL."""
+    if not relative_path:
+        return ""
+    if relative_path.startswith("http"):
+        return relative_path
+    base = SPACE_BASE_URL.rstrip("/") if SPACE_BASE_URL else ""
+    return f"{base}{relative_path}" if base else relative_path
+
+
+def save_bytes(data: bytes, ext: str, client_id: str = None) -> str:
+    """
+    ★ حفظ آمن: يعزل ملفات كل مستخدم في مجلد خاص به.
+    يعيد المسار النسبي (وليس الكامل) — استخدم _full_file_url للرابط الكامل.
+    """
+    if client_id is None:
+        client_id = _current_client_id.get()
+    
+    # تنظيف client_id لمنع أي محاولة اختراق مسار (Path Traversal)
+    safe_client = "".join(c for c in client_id if c.isalnum() or c in "-_")[:32] or "anonymous"
+    
+    # إنشاء مجلد المستخدم إذا لم يكن موجوداً
+    user_dir = FILES_DIR / safe_client
+    user_dir.mkdir(parents=True, exist_ok=True)
+    
+    filename = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
+    (user_dir / filename).write_bytes(data)
+    
+    return f"/files/{safe_client}/{filename}"
+
+
+# ══════════════════════════════════════════════════════════
+# ★ الوكيل الخارق (Super Agent Switch)
 # ══════════════════════════════════════════════════════════
 STATE_DIR = BASE_DIR / "state"
 STATE_DIR.mkdir(exist_ok=True)
 SUPER_AGENT_STATE_FILE = STATE_DIR / "super_agent.json"
 
-# القيمة الافتراضية: كل الأدوات مفعّلة
 _super_agent_enabled: bool = True
 
+
 def _load_super_agent_state() -> None:
-    """تحميل حالة الوكيل الخارق من القرص عند بدء التشغيل (لتبقى الحالة محفوظة بعد إعادة التشغيل)."""
     global _super_agent_enabled
     try:
         if SUPER_AGENT_STATE_FILE.exists():
             data = json.loads(SUPER_AGENT_STATE_FILE.read_text(encoding="utf-8"))
             _super_agent_enabled = bool(data.get("enabled", True))
-            logger.info(f"🔌 تم تحميل حالة الوكيل الخارق من القرص: enabled={_super_agent_enabled}")
+            logger.info(f"🔌 تم تحميل حالة الوكيل الخارق: enabled={_super_agent_enabled}")
     except Exception as e:
-        logger.warning(f"تعذّر تحميل حالة الوكيل الخارق، سيتم استخدام القيمة الافتراضية (مفعّل): {e}")
+        logger.warning(f"تعذّر تحميل حالة الوكيل الخارق: {e}")
         _super_agent_enabled = True
+
 
 def _save_super_agent_state() -> None:
     try:
         SUPER_AGENT_STATE_FILE.write_text(
-            json.dumps({"enabled": _super_agent_enabled}, ensure_ascii=False), encoding="utf-8"
+            json.dumps({"enabled": _super_agent_enabled}, ensure_ascii=False),
+            encoding="utf-8",
         )
     except Exception as e:
-        logger.warning(f"تعذّر حفظ حالة الوكيل الخارق على القرص: {e}")
+        logger.warning(f"تعذّر حفظ حالة الوكيل الخارق: {e}")
+
 
 def is_super_agent_enabled() -> bool:
     return _super_agent_enabled
 
+
 def set_super_agent_enabled(enabled: bool) -> Dict[str, Any]:
-    """تفعيل/تعطيل كل الأدوات دفعة واحدة. تُرجع ملخصاً بعدد الأدوات المتأثرة."""
     global _super_agent_enabled
     _super_agent_enabled = bool(enabled)
     _save_super_agent_state()
@@ -131,7 +196,7 @@ def set_super_agent_enabled(enabled: bool) -> Dict[str, Any]:
 
     logger.info(
         f"🔁 تم {'تفعيل' if _super_agent_enabled else 'تعطيل'} الوكيل الخارق — "
-        f"الأدوات المضمّنة={builtin_count}، أدوات الفيديو={video_count}، أدوات Hub={hub_count}"
+        f"الأدوات={builtin_count + video_count + hub_count}"
     )
     return {
         "enabled": _super_agent_enabled,
@@ -141,12 +206,12 @@ def set_super_agent_enabled(enabled: bool) -> Dict[str, Any]:
         "hub_tools_count": hub_count,
     }
 
+
 # ══════════════════════════════════════════════════════════
-# ★ ★ ★ تعريف TOOLS_MANIFEST (قبل استخدامه في _connect_video_mcp) ★ ★ ★
+# TOOLS_MANIFEST (قبل استخدامه في _connect_video_mcp)
 # ══════════════════════════════════════════════════════════
-TOOLS_MANIFEST = [
-    # سيتم إضافة أدوات الفيديو لاحقاً في _connect_video_mcp
-]
+TOOLS_MANIFEST: List[Dict[str, Any]] = []
+
 
 # ══════════════════════════════════════════════════════════
 # الاتصال بخادم أدوات الفيديو/الصوت
@@ -158,16 +223,17 @@ video_tool_names: set = set()
 video_tool_schemas: Dict[str, dict] = {}
 _video_exit_stack: Optional[AsyncExitStack] = None
 
+
 async def _connect_video_mcp() -> None:
     global video_session, video_tool_names, _video_exit_stack
     if not VIDEO_MCP_SCRIPT.exists():
-        logger.warning("video-audio-mcp/server.py غير موجود على القرص — سيتم تخطي أدوات الفيديو")
+        logger.warning("video-audio-mcp/server.py غير موجود — تخطي أدوات الفيديو")
         return
     try:
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
     except ImportError:
-        logger.warning("حزمة mcp غير مثبّتة — سيتم تخطي أدوات الفيديو")
+        logger.warning("حزمة mcp غير مثبّتة — تخطي أدوات الفيديو")
         return
     try:
         _video_exit_stack = AsyncExitStack()
@@ -193,11 +259,12 @@ async def _connect_video_mcp() -> None:
             video_tool_names.add(t.name)
             video_tool_schemas[t.name] = schema
         video_session = session
-        logger.info(f"Video-Audio MCP connected successfully: discovered {len(video_tool_names)} tools")
+        logger.info(f"Video-Audio MCP connected: {len(video_tool_names)} tools")
     except Exception as e:
-        logger.exception(f"فشل الاتصال بخادم video-audio-mcp: {e}")
+        logger.exception(f"فشل الاتصال بـ video-audio-mcp: {e}")
         video_session = None
         video_tool_names.clear()
+
 
 async def _disconnect_video_mcp() -> None:
     global _video_exit_stack
@@ -205,8 +272,9 @@ async def _disconnect_video_mcp() -> None:
         try:
             await _video_exit_stack.aclose()
         except Exception as e:
-            logger.warning(f"خطأ أثناء إغلاق اتصال video-audio-mcp: {e}")
+            logger.warning(f"خطأ أثناء إغلاق video-audio-mcp: {e}")
         _video_exit_stack = None
+
 
 def _resolve_video_args(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     schema = video_tool_schemas.get(name) or {}
@@ -236,16 +304,18 @@ def _resolve_video_args(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
             used_targets.add(best)
     return resolved
 
+
 async def _call_video_tool(name: str, arguments: Dict[str, Any]) -> str:
     if not video_session:
-        raise RuntimeError("خادم أدوات الفيديو غير متصل حالياً")
+        raise RuntimeError("خادم أدوات الفيديو غير متصل")
     arguments = _resolve_video_args(name, arguments)
     result = await video_session.call_tool(name, arguments)
     parts = [getattr(c, "text", None) or str(c) for c in (result.content or [])]
     return "\n".join(p for p in parts if p)
 
+
 # ══════════════════════════════════════════════════════════
-# دعم اللغة العربية في ملفات PDF
+# دعم اللغة العربية في PDF
 # ══════════════════════════════════════════════════════════
 FONTS_DIR = BASE_DIR / "fonts"
 FONTS_DIR.mkdir(exist_ok=True)
@@ -253,6 +323,7 @@ ARABIC_FONT_PATH = FONTS_DIR / "Amiri-Regular.ttf"
 ARABIC_FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/amiri/Amiri-Regular.ttf"
 ARABIC_FONT_NAME = "Amiri"
 _arabic_font_ready = False
+
 
 async def _ensure_arabic_font() -> None:
     global _arabic_font_ready
@@ -262,16 +333,16 @@ async def _ensure_arabic_font() -> None:
                 r = await client.get(ARABIC_FONT_URL)
                 r.raise_for_status()
                 ARABIC_FONT_PATH.write_bytes(r.content)
-        
+
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.ttfonts import TTFont
         pdfmetrics.registerFont(TTFont(ARABIC_FONT_NAME, str(ARABIC_FONT_PATH)))
         _arabic_font_ready = True
         logger.info("Arabic PDF font (Amiri) registered successfully")
-        
     except Exception as e:
-        logger.warning(f"تعذّر تجهيز الخط العربي لملفات PDF: {e}")
+        logger.warning(f"تعذّر تجهيز الخط العربي: {e}")
         _arabic_font_ready = False
+
 
 def _shape_text(text: str) -> str:
     try:
@@ -280,6 +351,7 @@ def _shape_text(text: str) -> str:
         return get_display(arabic_reshaper.reshape(text))
     except Exception:
         return text
+
 
 # ══════════════════════════════════════════════════════════
 # lifespan
@@ -298,7 +370,8 @@ async def lifespan(app: FastAPI):
     await _disconnect_video_mcp()
     await registry.shutdown()
 
-app = FastAPI(title="9Router Tools Server", version="1.0.2", lifespan=lifespan)
+
+app = FastAPI(title="9Router Tools Server", version="1.0.5", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -307,35 +380,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.middleware("http")
 async def _security_headers(request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     return response
 
+
 app.mount("/files", StaticFiles(directory=str(FILES_DIR)), name="files")
 
-def save_bytes(data: bytes, ext: str) -> str:
-    filename = f"{uuid.uuid4().hex}.{ext}"
-    (FILES_DIR / filename).write_bytes(data)
-    return f"/files/{filename}"
 
-# ══════════════════════════════════════════════════════════
-# ★ ★ ★ دالة move_to_files ★ ★ ★
-# ══════════════════════════════════════════════════════════
 def move_to_files(source_path: str, filename: str = None) -> str:
-    FILES_DIR = Path("/app/files")
-    FILES_DIR.mkdir(parents=True, exist_ok=True)
+    dest_dir = Path("/app/files")
+    dest_dir.mkdir(parents=True, exist_ok=True)
     if filename is None:
         filename = Path(source_path).name
-    dest_path = FILES_DIR / filename
+    dest_path = dest_dir / filename
     shutil.copy2(source_path, dest_path)
-    return f"/files/{filename}"
+    return _full_file_url(f"/files/{filename}")
+
 
 # ══════════════════════════════════════════════════════════
 # حماية SSRF
 # ══════════════════════════════════════════════════════════
 _BLOCKED_HOSTNAMES = {"localhost", "metadata.google.internal"}
+
 
 def _is_url_safe(url: str) -> bool:
     try:
@@ -362,15 +432,12 @@ def _is_url_safe(url: str) -> bool:
         except ValueError:
             return False
         if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_reserved
-            or ip.is_multicast
-            or ip.is_unspecified
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
         ):
             return False
     return True
+
 
 async def _download(url: Optional[str], base64_data: Optional[str]) -> bytes:
     if base64_data:
@@ -381,10 +448,11 @@ async def _download(url: Optional[str], base64_data: Optional[str]) -> bytes:
         async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
             r = await client.get(url)
             if r.is_redirect:
-                raise ValueError("إعادة التوجيه (redirect) غير مسموح بها لأسباب أمنية (SSRF)")
+                raise ValueError("إعادة التوجيه غير مسموحة لأسباب أمنية (SSRF)")
             r.raise_for_status()
             return r.content
     raise ValueError("يجب توفير url أو base64_data")
+
 
 # ══════════════════════════════════════════════════════════
 # 1) FIRECRAWL
@@ -410,6 +478,7 @@ async def firecrawl_search(query: str, limit: int = 5) -> dict:
             })
         return {"results": out}
 
+
 async def firecrawl_scrape(url: str) -> dict:
     if not FIRECRAWL_API_KEY:
         return {"error": "FIRECRAWL_API_KEY غير مضبوط على الخادم"}
@@ -423,6 +492,7 @@ async def firecrawl_scrape(url: str) -> dict:
         data = r.json()
         markdown = (data.get("data") or {}).get("markdown", "")
         return {"markdown": markdown[:8000]}
+
 
 # ══════════════════════════════════════════════════════════
 # 2) CONTEXT7
@@ -442,6 +512,7 @@ async def context7_resolve_library(query: str) -> dict:
         libs = [{"id": it.get("id"), "title": it.get("title") or it.get("name")} for it in results[:8]]
         return {"libraries": libs}
 
+
 async def context7_get_docs(library_id: str, topic: Optional[str] = None) -> dict:
     if not CONTEXT7_API_KEY:
         return {"error": "CONTEXT7_API_KEY غير مضبوط على الخادم"}
@@ -457,51 +528,59 @@ async def context7_get_docs(library_id: str, topic: Optional[str] = None) -> dic
         content = data.get("content") or data.get("text") or json.dumps(data, ensure_ascii=False)
         return {"docs": content[:6000]}
 
+
 # ══════════════════════════════════════════════════════════
-# 3) COMPOSIO — التعديلات الجراحية النهائية
+# 3) COMPOSIO — قراءة كسولة للمفتاح + revoke
 # ══════════════════════════════════════════════════════════
+
 async def composio_list_connected_tools() -> dict:
-    if not COMPOSIO_API_KEY:
+    api_key = _get_composio_api_key()
+    if not api_key:
         return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
+
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.get(
             f"{COMPOSIO_BASE_URL}/connected_accounts",
-            headers={"x-api-key": COMPOSIO_API_KEY},
+            headers={"x-api-key": api_key},
         )
-        r.raise_for_status()
+        if r.status_code == 401:
+            return {"error": "مفتاح Composio API غير صالح أو منتهي. تحقق من COMPOSIO_API_KEY."}
+        if r.status_code != 200:
+            return {"error": f"Composio API error ({r.status_code}): {r.text[:500]}"}
         data = r.json()
         items = data.get("items", [])
-        
-        # ✅ تسجيل العينة الخام للتشخيص
+
         if items:
             logger.info(f"📋 Raw connected_account sample: {items[0]}")
-        
+
         tools = [{
             "slug": (it.get("toolkit") or {}).get("slug"),
             "id": it.get("id"),
             "alias": it.get("alias"),
             "status": it.get("status"),
-            # ✅ إضافة user_id من الحقل الصحيح
             "user_id": it.get("user_id") or it.get("entity_id") or it.get("entityId"),
         } for it in items]
-        
+
         return {
             "connected_tools": tools,
             "hint": (
                 "استخدم حقل 'user_id' هنا بالضبط عند استدعاء composio_execute_tool — "
-                "لا تخترع قيمة عشوائية مثل 'user_123'. اختر حساباً بحالة status='ACTIVE' فقط."
+                "لا تخترع قيمة عشوائية. اختر حساباً بحالة status='ACTIVE' فقط."
             ),
         }
 
+
 async def composio_list_tools(toolkit_slug: str, limit: int = 20) -> dict:
-    if not COMPOSIO_API_KEY:
+    api_key = _get_composio_api_key()
+    if not api_key:
         return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
     if not toolkit_slug or not toolkit_slug.strip():
         return {
             "error": "المعامل 'toolkit_slug' مطلوب ولا يمكن أن يكون فارغاً.",
-            "suggestion": "استخدم composio_list_connected_tools أولاً للحصول على قائمة toolkits المتصلة.",
-            "example": "مثال: toolkit_slug='gmail' أو toolkit_slug='github'"
+            "suggestion": "استخدم composio_list_connected_tools أولاً.",
+            "example": "toolkit_slug='gmail' أو 'github'",
         }
+
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.get(
             f"{COMPOSIO_BASE_URL_V31}/tools",
@@ -510,19 +589,21 @@ async def composio_list_tools(toolkit_slug: str, limit: int = 20) -> dict:
                 "toolkit_versions": "latest",
                 "limit": limit,
             },
-            headers={"x-api-key": COMPOSIO_API_KEY},
+            headers={"x-api-key": api_key},
         )
-        r.raise_for_status()
+        if r.status_code == 401:
+            return {"error": "مفتاح Composio API غير صالح."}
+        if r.status_code != 200:
+            return {"error": f"Composio API error ({r.status_code}): {r.text[:500]}"}
         data = r.json()
         items = data.get("items", data if isinstance(data, list) else [])
         tools = [{
             "slug": it.get("slug") or it.get("name"),
             "description": (it.get("description") or "")[:200],
         } for it in items[:limit]]
-        
         logger.info(f"📋 Tools found for '{toolkit_slug}': {[t['slug'] for t in tools]}")
-        
         return {"toolkit": toolkit_slug, "tools": tools}
+
 
 async def composio_execute_tool(
     slug: str,
@@ -530,32 +611,32 @@ async def composio_execute_tool(
     user_id: Optional[str] = None,
     version: str = "latest",
 ) -> dict:
-    if not COMPOSIO_API_KEY:
+    api_key = _get_composio_api_key()
+    if not api_key:
         return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
     if not slug or not slug.strip():
         return {
             "error": "المعامل 'slug' مطلوب ولا يمكن أن يكون فارغاً.",
-            "suggestion": "استخدم composio_list_tools أولاً لمعرفة الـ slug الصحيح."
+            "suggestion": "استخدم composio_list_tools أولاً.",
         }
-    
-    effective_user_id = user_id or COMPOSIO_DEFAULT_USER_ID
+
+    effective_user_id = user_id or _get_composio_default_user_id()
     payload: Dict[str, Any] = {
         "arguments": arguments or {},
         "version": version,
         "user_id": effective_user_id,
     }
-    
+
     async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
         r = await client.post(
             f"{COMPOSIO_BASE_URL_V31}/tools/execute/{slug}",
-            headers={"x-api-key": COMPOSIO_API_KEY, "Content-Type": "application/json"},
+            headers={"x-api-key": api_key, "Content-Type": "application/json"},
             json=payload,
         )
         if r.status_code == 404:
             error_text = r.text.lower()
             toolkit_guess = slug.split("_")[0].lower()
-            
-            # ✅ حالة 1: لا يوجد حساب متصل بهذا الـ user_id
+
             if "no connected account" in error_text or "not found for user" in error_text:
                 connected = await composio_list_connected_tools()
                 active_accounts = [
@@ -570,23 +651,25 @@ async def composio_execute_tool(
                     "active_accounts_found": active_accounts,
                     "instruction": (
                         "إن كانت active_accounts_found غير فارغة، أعد الاستدعاء بنفس user_id "
-                        "الموجود في أحد عناصرها بالضبط. إن كانت فارغة، لا يوجد حساب نشط إطلاقاً "
-                        "ويجب إعادة الربط عبر composio_authorize_toolkit أولاً."
+                        "الموجود في أحد عناصرها. إن كانت فارغة، يجب إعادة الربط."
                     ),
                 }
-            
-            # ✅ حالة 2: اسم slug غير صحيح (احتياطي)
+
             suggestion = await composio_list_tools(toolkit_slug=toolkit_guess, limit=50)
             return {
                 "error": f"الأداة '{slug}' غير موجودة (404).",
                 "status_code": 404,
                 "composio_detail": r.text[:500],
                 "correct_slugs_for_this_toolkit": suggestion.get("tools", []),
-                "instruction": "استخدم أحد الأسماء في 'correct_slugs_for_this_toolkit' حرفياً، لا تخمّن الاسم."
+                "instruction": "استخدم أحد الأسماء في 'correct_slugs_for_this_toolkit' حرفياً.",
             }
-        
-        r.raise_for_status()
+
+        if r.status_code == 401:
+            return {"error": "مفتاح Composio API غير صالح."}
+        if r.status_code not in (200, 201):
+            return {"error": f"Composio API error ({r.status_code}): {r.text[:500]}"}
         return r.json()
+
 
 async def composio_create_session(
     user_id: str,
@@ -594,12 +677,13 @@ async def composio_create_session(
     wait_for_connections: bool = False,
     callback_url: Optional[str] = None,
 ) -> dict:
-    if not COMPOSIO_API_KEY:
+    api_key = _get_composio_api_key()
+    if not api_key:
         return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
     if not user_id or not user_id.strip():
         return {
             "error": "المعامل 'user_id' مطلوب ولا يمكن أن يكون فارغاً.",
-            "suggestion": "قدم معرف مستخدم صالح (مثل 'user_123' أو معرف البريد الإلكتروني)."
+            "suggestion": "قدم معرف مستخدم صالح.",
         }
 
     payload: Dict[str, Any] = {"user_id": user_id}
@@ -626,7 +710,7 @@ async def composio_create_session(
     async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
         r = await client.post(
             f"{COMPOSIO_BASE_URL_V31}/tool_router/session",
-            headers={"x-api-key": COMPOSIO_API_KEY, "Content-Type": "application/json"},
+            headers={"x-api-key": api_key, "Content-Type": "application/json"},
             json=payload,
         )
         if r.status_code == 400:
@@ -634,28 +718,20 @@ async def composio_create_session(
                 "error": "خطأ في التحقق من صحة الطلب",
                 "detail": r.text[:500],
                 "payload_sent": payload,
-                "suggestion": "تأكد من أن جميع الحقول متوافقة مع إصدار API المستخدم"
             }
-        r.raise_for_status()
+        if r.status_code == 401:
+            return {"error": "مفتاح Composio API غير صالح."}
+        if r.status_code not in (200, 201):
+            return {"error": f"Composio API error ({r.status_code}): {r.text[:500]}"}
         data = r.json()
-        
+
         tool_router_tools = data.get("tool_router_tools", [])
         session_id = data.get("session_id")
-        logger.info(f"📋 Session {session_id} created successfully")
-        logger.info(f"📋 Tool router tools count: {len(tool_router_tools)}")
-        
+        logger.info(f"📋 Session {session_id} created. Tools: {len(tool_router_tools)}")
+
         if tool_router_tools:
-            sample = tool_router_tools[:10]
-            logger.info(f"📋 Sample tools (first 10): {sample}")
-            
-            execute_tools = [t for t in tool_router_tools if "EXECUTE" in str(t).upper() or "SEARCH" in str(t).upper()]
-            if execute_tools:
-                logger.info(f"✅ Found execute/search meta-tools: {execute_tools}")
-            else:
-                logger.warning("⚠️ No execute/search meta-tools found in session response!")
-        else:
-            logger.warning("⚠️ No tool_router_tools returned in session response!")
-        
+            logger.info(f"📋 Sample tools: {tool_router_tools[:10]}")
+
         return {
             "session_id": session_id,
             "mcp_url": (data.get("mcp") or {}).get("url"),
@@ -664,61 +740,75 @@ async def composio_create_session(
             "tools_count": len(tool_router_tools),
         }
 
+
 async def composio_get_session(session_id: str) -> dict:
-    if not COMPOSIO_API_KEY:
+    api_key = _get_composio_api_key()
+    if not api_key:
         return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
     if not session_id or not session_id.strip():
-        return {"error": "المعامل 'session_id' مطلوب ولا يمكن أن يكون فارغاً."}
+        return {"error": "المعامل 'session_id' مطلوب."}
+
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.get(
             f"{COMPOSIO_BASE_URL_V31}/tool_router/session/{session_id}",
-            headers={"x-api-key": COMPOSIO_API_KEY},
+            headers={"x-api-key": api_key},
         )
         if r.status_code == 404:
             return {"error": f"الجلسة '{session_id}' غير موجودة.", "status_code": 404}
-        r.raise_for_status()
+        if r.status_code == 401:
+            return {"error": "مفتاح Composio API غير صالح."}
+        if r.status_code != 200:
+            return {"error": f"Composio API error ({r.status_code}): {r.text[:500]}"}
         return r.json()
 
+
 async def composio_session_toolkits(session_id: str) -> dict:
-    if not COMPOSIO_API_KEY:
+    api_key = _get_composio_api_key()
+    if not api_key:
         return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
     if not session_id or not session_id.strip():
-        return {"error": "المعامل 'session_id' مطلوب ولا يمكن أن يكون فارغاً."}
+        return {"error": "المعامل 'session_id' مطلوب."}
+
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.get(
             f"{COMPOSIO_BASE_URL_V31}/tool_router/session/{session_id}/toolkits",
-            headers={"x-api-key": COMPOSIO_API_KEY},
+            headers={"x-api-key": api_key},
         )
         if r.status_code == 404:
             return {"error": f"الجلسة '{session_id}' غير موجودة.", "status_code": 404}
-        r.raise_for_status()
+        if r.status_code == 401:
+            return {"error": "مفتاح Composio API غير صالح."}
+        if r.status_code != 200:
+            return {"error": f"Composio API error ({r.status_code}): {r.text[:500]}"}
         return r.json()
+
 
 async def composio_authorize_toolkit(
     session_id: str,
     toolkit: str,
     callback_url: Optional[str] = None,
 ) -> dict:
-    if not COMPOSIO_API_KEY:
+    api_key = _get_composio_api_key()
+    if not api_key:
         return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
     if not session_id or not session_id.strip():
-        return {"error": "المعامل 'session_id' مطلوب ولا يمكن أن يكون فارغاً."}
+        return {"error": "المعامل 'session_id' مطلوب."}
     if not toolkit or not toolkit.strip():
-        return {"error": "المعامل 'toolkit' مطلوب ولا يمكن أن يكون فارغاً."}
-    
+        return {"error": "المعامل 'toolkit' مطلوب."}
+
     effective_callback = callback_url or (
         f"{SPACE_BASE_URL}/oauth-callback-close" if SPACE_BASE_URL else None
     )
-    
+
     payload: Dict[str, Any] = {"toolkit": toolkit}
     if effective_callback:
         payload["callback_url"] = effective_callback
-    
+
     url = f"{COMPOSIO_BASE_URL}/tool_router/session/{session_id}/link"
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.post(
             url,
-            headers={"x-api-key": COMPOSIO_API_KEY, "Content-Type": "application/json"},
+            headers={"x-api-key": api_key, "Content-Type": "application/json"},
             json=payload,
         )
         if r.status_code == 404:
@@ -726,26 +816,94 @@ async def composio_authorize_toolkit(
                 "error": f"الجلسة '{session_id}' غير موجودة أو التطبيق '{toolkit}' غير صالح (404).",
                 "status_code": 404,
             }
-        r.raise_for_status()
+        if r.status_code == 401:
+            return {"error": "مفتاح Composio API غير صالح."}
+        if r.status_code not in (200, 201):
+            return {"error": f"Composio API error ({r.status_code}): {r.text[:500]}"}
         data = r.json()
         redirect_url = data.get("redirect_url") or data.get("redirectUrl")
         return {"redirect_url": redirect_url, "toolkit": toolkit, "raw": data}
 
+
 async def composio_close_session(session_id: str) -> dict:
-    if not COMPOSIO_API_KEY:
+    api_key = _get_composio_api_key()
+    if not api_key:
         return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
     if not session_id or not session_id.strip():
-        return {"error": "المعامل 'session_id' مطلوب ولا يمكن أن يكون فارغاً."}
-    
+        return {"error": "المعامل 'session_id' مطلوب."}
+
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.delete(
             f"{COMPOSIO_BASE_URL_V31}/tool_router/session/{session_id}",
-            headers={"x-api-key": COMPOSIO_API_KEY},
+            headers={"x-api-key": api_key},
         )
         if r.status_code == 404:
             return {"error": f"الجلسة '{session_id}' غير موجودة أو محذوفة مسبقاً.", "status_code": 404}
-        r.raise_for_status()
-        return r.json()
+        if r.status_code == 401:
+            return {"error": "مفتاح Composio API غير صالح."}
+        if r.status_code not in (200, 201, 204):
+            return {"error": f"Composio API error ({r.status_code}): {r.text[:500]}"}
+        return r.json() if r.content else {"ok": True, "closed": session_id}
+
+
+# ★ ★ ★ composio_revoke_account (تسجيل الخروج الفعلي — v3.1 + DELETE) ★ ★ ★
+async def composio_revoke_account(connected_account_id: str) -> dict:
+    """
+    ✅ تسجيل خروج فعلي: حذف الحساب من Composio وإلغاء التوثيق.
+    يستخدم v3.1 مع revoke_on_delete=true.
+    """
+    api_key = _get_composio_api_key()
+    if not api_key:
+        return {"ok": False, "error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
+
+    cid = (connected_account_id or "").strip()
+    if not cid:
+        return {"ok": False, "error": "connected_account_id مطلوب"}
+
+    url = f"{COMPOSIO_BASE_URL_V31}/connected_accounts/{cid}?revoke_on_delete=true"
+    headers = {"x-api-key": api_key}
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        r = await client.delete(url, headers=headers)
+        info = {
+            "upstream_status": r.status_code,
+            "upstream_body": r.text[:300],
+            "url": url,
+        }
+        if r.status_code == 404:
+            return {"ok": True, "revoked": cid, "note": "already_deleted", **info}
+        if r.status_code not in (200, 204):
+            return {"ok": False, "error": f"Composio رفض الحذف ({r.status_code})", **info}
+        try:
+            body = r.json()
+            success = r.status_code == 204 or body.get("success") is True
+        except Exception:
+            success = r.status_code == 204
+        if not success:
+            return {"ok": False, "error": "رد غير متوقع من Composio", **info}
+
+        status_after = "UNKNOWN"
+        try:
+            g = await client.get(
+                f"{COMPOSIO_BASE_URL_V31}/connected_accounts/{cid}",
+                headers=headers,
+            )
+            if g.status_code == 404:
+                status_after = "DELETED"
+            elif g.status_code == 200:
+                status_after = str(g.json().get("status", "")).upper()
+        except Exception:
+            pass
+
+    if status_after == "ACTIVE":
+        return {
+            "ok": False,
+            "error": "حُذف لكن الحساب ما زال ACTIVE — revoke_on_delete يعمل في الخلفية",
+            "status_after": status_after,
+            **info,
+        }
+    return {"ok": True, "revoked": cid, "status_after": status_after, **info}
+
 
 # ══════════════════════════════════════════════════════════
 # 4) المستندات — DOCX / PPTX / PDF / XLSX / Markdown
@@ -766,6 +924,7 @@ def _apply_markdown_lines(add_heading, add_paragraph, add_bullet, text: str):
         else:
             add_paragraph(line)
 
+
 def create_docx(title: str, content_markdown: str) -> dict:
     from docx import Document
     doc = Document()
@@ -778,7 +937,9 @@ def create_docx(title: str, content_markdown: str) -> dict:
     )
     buf = io.BytesIO()
     doc.save(buf)
-    return {"file_url": save_bytes(buf.getvalue(), "docx")}
+    rel = save_bytes(buf.getvalue(), "docx")
+    return {"file_url": _full_file_url(rel), "relative_path": rel}
+
 
 def create_pptx(title: str, slides: List[Dict[str, Any]]) -> dict:
     from pptx import Presentation
@@ -796,7 +957,9 @@ def create_pptx(title: str, slides: List[Dict[str, Any]]) -> dict:
             p.text = b
     buf = io.BytesIO()
     prs.save(buf)
-    return {"file_url": save_bytes(buf.getvalue(), "pptx")}
+    rel = save_bytes(buf.getvalue(), "pptx")
+    return {"file_url": _full_file_url(rel), "relative_path": rel}
+
 
 def create_pdf(title: str, content_markdown: str) -> dict:
     from reportlab.lib.pagesizes import A4
@@ -821,7 +984,9 @@ def create_pdf(title: str, content_markdown: str) -> dict:
         content_markdown,
     )
     doc.build(story)
-    return {"file_url": save_bytes(buf.getvalue(), "pdf")}
+    rel = save_bytes(buf.getvalue(), "pdf")
+    return {"file_url": _full_file_url(rel), "relative_path": rel}
+
 
 async def read_pdf(url: Optional[str] = None, base64_data: Optional[str] = None, max_pages: int = 20) -> dict:
     data = await _download(url, base64_data)
@@ -839,11 +1004,13 @@ async def read_pdf(url: Optional[str] = None, base64_data: Optional[str] = None,
     full_text = "\n".join(text_parts)
     return {"text": full_text[:12000], "pages_read": len(text_parts)}
 
+
 async def pdf_info(url: Optional[str] = None, base64_data: Optional[str] = None) -> dict:
     data = await _download(url, base64_data)
     import fitz
     doc = fitz.open(stream=data, filetype="pdf")
     return {"pages": doc.page_count, "metadata": doc.metadata}
+
 
 def create_xlsx(title: str, headers: Optional[List[str]] = None, rows: Optional[List[List[Any]]] = None) -> dict:
     import openpyxl
@@ -856,7 +1023,9 @@ def create_xlsx(title: str, headers: Optional[List[str]] = None, rows: Optional[
         ws.append(row)
     buf = io.BytesIO()
     wb.save(buf)
-    return {"file_url": save_bytes(buf.getvalue(), "xlsx")}
+    rel = save_bytes(buf.getvalue(), "xlsx")
+    return {"file_url": _full_file_url(rel), "relative_path": rel}
+
 
 async def read_xlsx(url: Optional[str] = None, base64_data: Optional[str] = None, sheet: Optional[str] = None) -> dict:
     data = await _download(url, base64_data)
@@ -868,26 +1037,28 @@ async def read_xlsx(url: Optional[str] = None, base64_data: Optional[str] = None
         "total_rows": int(len(df)),
     }
 
+
 def markdown_to_html(markdown_text: str) -> dict:
     import markdown as md
     html = md.markdown(markdown_text, extensions=["tables", "fenced_code"])
     return {"html": html}
 
+
 async def fetch_media_to_file(url: Optional[str] = None, base64_data: Optional[str] = None, ext: str = "mp4") -> dict:
     data = await _download(url, base64_data)
-    filename = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
-    path = FILES_DIR / filename
-    path.write_bytes(data)
-    return {"local_path": str(path), "file_url": f"/files/{filename}"}
+    rel = save_bytes(data, ext)
+    return {"local_path": str(FILES_DIR / rel.lstrip("/").replace("files/", "", 1)), "file_url": _full_file_url(rel), "relative_path": rel}
+
 
 def write_text_file(content: str, ext: str = "srt") -> dict:
-    filename = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
-    path = FILES_DIR / filename
-    path.write_text(content, encoding="utf-8")
-    return {"local_path": str(path), "file_url": f"/files/{filename}"}
+    rel = save_bytes(content.encode("utf-8"), ext)
+    # local_path يبقى بنفس التنسيق القديم للتوافق مع أدوات الفيديو
+    local = str(FILES_DIR / rel.lstrip("/").replace("files/", "", 1))
+    return {"local_path": local, "file_url": _full_file_url(rel), "relative_path": rel}
+
 
 # ══════════════════════════════════════════════════════════
-# سجل الخرائط والدوال الداخلية لـ /call
+# سجل TOOL_FUNCTIONS
 # ══════════════════════════════════════════════════════════
 TOOL_FUNCTIONS = {
     "firecrawl_search": firecrawl_search,
@@ -902,6 +1073,7 @@ TOOL_FUNCTIONS = {
     "composio_session_toolkits": composio_session_toolkits,
     "composio_authorize_toolkit": composio_authorize_toolkit,
     "composio_close_session": composio_close_session,
+    "composio_revoke_account": composio_revoke_account,
     "create_docx": create_docx,
     "create_pptx": create_pptx,
     "create_pdf": create_pdf,
@@ -914,13 +1086,10 @@ TOOL_FUNCTIONS = {
     "write_text_file": write_text_file,
 }
 
-# ══════════════════════════════════════════════════════════
-# قائمة الأدوات المتاحة للنظام الخارجي (OpenAI Manifest)
-# ══════════════════════════════════════════════════════════
-# تم تعريف TOOLS_MANIFEST مسبقاً كقائمة فارغة، وسيتم ملؤها في _connect_video_mcp
-# لكن نحتاج إلى إضافة الأدوات المضمّنة الأساسية هنا (باستثناء أدوات الفيديو التي ستُضاف لاحقاً)
 
-# نضيف الأدوات المضمّنة الأساسية (باستثناء أدوات الفيديو)
+# ══════════════════════════════════════════════════════════
+# TOOLS_MANIFEST — الأدوات المضمّنة
+# ══════════════════════════════════════════════════════════
 TOOLS_MANIFEST.extend([
     {"type": "function", "function": {
         "name": "firecrawl_search",
@@ -959,64 +1128,77 @@ TOOLS_MANIFEST.extend([
     }},
     {"type": "function", "function": {
         "name": "composio_list_tools",
-        "description": "جلب قائمة الأدوات القابلة للتنفيذ فعلياً داخل تطبيق معيّن. يجب استدعاء هذه الدالة أولاً للحصول على slugs صالحة قبل استخدام composio_execute_tool.",
+        "description": "جلب قائمة الأدوات القابلة للتنفيذ داخل تطبيق معيّن. يجب استدعاؤها أولاً للحصول على slugs صالحة.",
         "parameters": {"type": "object", "properties": {
-            "toolkit_slug": {"type": "string", "description": "✅ مطلوب: اسم التطبيق بصيغته الصغيرة (مثل 'gmail'، 'github'، 'slack') — لا يمكن أن يكون فارغاً."},
+            "toolkit_slug": {"type": "string", "description": "✅ اسم التطبيق (مثل 'gmail')"},
             "limit": {"type": "integer", "default": 20},
         }, "required": ["toolkit_slug"]},
     }},
     {"type": "function", "function": {
         "name": "composio_execute_tool",
         "description": (
-            "✅ تنفيذ أداة Composio. ⚠️ إلزامي: لا تخترع قيمة user_id عشوائية أبداً. "
-            "استدعِ composio_list_connected_tools أولاً، واستخدم حقل 'user_id' الموجود فيه "
-            "لحساب بحالة status='ACTIVE' فقط ونفس toolkit المطلوب."
+            "✅ تنفيذ أداة Composio. ⚠️ إلزامي: لا تخترع user_id عشوائياً. "
+            "استدعِ composio_list_connected_tools أولاً."
         ),
         "parameters": {"type": "object", "properties": {
-            "slug": {"type": "string", "description": "✅ مطلوب: المعرف الفريد للأداة — لا يمكن أن يكون فارغاً."},
-            "arguments": {"type": "object", "description": "معاملات الأداة المطلوبة (تعتمد على الأداة المحددة)."},
-            "user_id": {"type": "string", "description": "⚠️ إلزامي: القيمة الحقيقية من composio_list_connected_tools — ليس معرّفاً تخترعه."},
+            "slug": {"type": "string"},
+            "arguments": {"type": "object"},
+            "user_id": {"type": "string"},
         }, "required": ["slug", "user_id"]},
     }},
     {"type": "function", "function": {
         "name": "composio_create_session",
-        "description": "✅ إنشاء جلسة Composio Tool Router مع تفعيل جميع الأدوات التنفيذية تلقائياً. بعد الإنشاء، استخدم composio_authorize_toolkit لكل تطبيق يحتاج مصادقة.",
+        "description": "إنشاء جلسة Composio Tool Router.",
         "parameters": {"type": "object", "properties": {
-            "user_id": {"type": "string", "description": "✅ مطلوب: معرف المستخدم — لا يمكن أن يكون فارغاً."},
-            "toolkits": {"type": "array", "items": {"type": "string"}, "description": "قائمة التطبيقات المطلوب تفعيلها (مثل ['gmail', 'github']). اتركها فارغة أو أرسل ['all'] لتفعيل كل شيء."},
-            "wait_for_connections": {"type": "boolean", "default": False, "description": "انتظار اكتمال المصادقات قبل إنهاء الجلسة."},
-            "callback_url": {"type": "string", "description": "رابط إعادة التوجيه بعد المصادقة."},
+            "user_id": {"type": "string"},
+            "toolkits": {"type": "array", "items": {"type": "string"}},
+            "wait_for_connections": {"type": "boolean", "default": False},
+            "callback_url": {"type": "string"},
         }, "required": ["user_id"]},
     }},
     {"type": "function", "function": {
         "name": "composio_get_session",
-        "description": "جلب حالة جلسة Tool Router موجودة مسبقاً.",
+        "description": "جلب حالة جلسة Tool Router.",
         "parameters": {"type": "object", "properties": {
-            "session_id": {"type": "string", "description": "✅ مطلوب: معرف الجلسة — لا يمكن أن يكون فارغاً."},
+            "session_id": {"type": "string"},
         }, "required": ["session_id"]},
     }},
     {"type": "function", "function": {
         "name": "composio_session_toolkits",
         "description": "عرض توليكيتات جلسة معيّنة وحالة اتصال كل منها.",
         "parameters": {"type": "object", "properties": {
-            "session_id": {"type": "string", "description": "✅ مطلوب: معرف الجلسة — لا يمكن أن يكون فارغاً."},
+            "session_id": {"type": "string"},
         }, "required": ["session_id"]},
     }},
     {"type": "function", "function": {
         "name": "composio_authorize_toolkit",
-        "description": "✅ إنشاء رابط تسجيل دخول (Connect Link) لتطبيق واحد (toolkit) داخل جلسة Tool Router موجودة. بعد نجاح المصادقة، سيُغلق النافذة تلقائياً.",
+        "description": "إنشاء رابط تسجيل دخول (Connect Link) لتطبيق واحد.",
         "parameters": {"type": "object", "properties": {
-            "session_id": {"type": "string", "description": "✅ مطلوب: معرّف الجلسة الناتج عن composio_create_session — لا يمكن أن يكون فارغاً."},
-            "toolkit": {"type": "string", "description": "✅ مطلوب: اسم التطبيق بصيغته الصغيرة، مثل gmail أو slack أو github — لا يمكن أن يكون فارغاً."},
-            "callback_url": {"type": "string", "description": "رابط اختياري يُعاد توجيه المستخدم إليه بعد إتمام تسجيل الدخول (سيُستخدم رابط الإغلاق التلقائي افتراضياً)."},
+            "session_id": {"type": "string"},
+            "toolkit": {"type": "string"},
+            "callback_url": {"type": "string"},
         }, "required": ["session_id", "toolkit"]},
     }},
     {"type": "function", "function": {
         "name": "composio_close_session",
-        "description": "✅ إغلاق/حذف جلسة Tool Router بشكل نهائي. استخدمها بعد انتهاء المحادثة أو المهمة لتحرير الموارد، لأن جلسات Tool Router لا تنتهي صلاحيتها تلقائياً.",
+        "description": "إغلاق/حذف جلسة Tool Router نهائياً.",
         "parameters": {"type": "object", "properties": {
-            "session_id": {"type": "string", "description": "✅ مطلوب: معرّف الجلسة المراد إغلاقها — لا يمكن أن يكون فارغاً."},
+            "session_id": {"type": "string"},
         }, "required": ["session_id"]},
+    }},
+    {"type": "function", "function": {
+        "name": "composio_revoke_account",
+        "description": (
+            "✅ تسجيل الخروج الفعلي من تطبيق Composio — يلغي التفويض "
+            "ويُبقي السجل قابلاً للاستعادة. "
+            "⚠️ استدعِ composio_list_connected_tools أولاً للحصول على 'id'."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "connected_account_id": {
+                "type": "string",
+                "description": "معرّف الحساب من حقل 'id' في composio_list_connected_tools.",
+            },
+        }, "required": ["connected_account_id"]},
     }},
     {"type": "function", "function": {
         "name": "create_docx",
@@ -1089,40 +1271,48 @@ TOOLS_MANIFEST.extend([
     }},
     {"type": "function", "function": {
         "name": "fetch_media_to_file",
-        "description": "ينزّل رابط فيديو/صوت (أو base64) ويحفظه كملف فعلي على الخادم، ويُرجع local_path لاستخدامه كمدخل لأدوات الفيديو/الصوت (video_path, input_audio_path...). استخدمها دائماً قبل أي أداة فيديو تحتاج ملفاً من رابط خارجي.",
+        "description": "ينزّل رابط فيديو/صوت (أو base64) ويحفظه كملف فعلي على الخادم، ويُرجع local_path.",
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string"},
             "base64_data": {"type": "string"},
-            "ext": {"type": "string", "description": "امتداد الملف الناتج، مثل mp4 أو mp3 أو wav", "default": "mp4"},
+            "ext": {"type": "string", "default": "mp4"},
         }},
     }},
     {"type": "function", "function": {
         "name": "write_text_file",
-        "description": "يكتب نصاً مباشرة (بدون رابط أو base64) إلى ملف حقيقي على الخادم، ويُرجع local_path. استخدمها لإنشاء ملفات ترجمة SRT قبل add_subtitles، أو أي نص آخر تحتاجه أدوات الفيديو كمسار ملف.",
+        "description": "يكتب نصاً مباشرة إلى ملف حقيقي على الخادم، ويُرجع local_path.",
         "parameters": {"type": "object", "properties": {
-            "content": {"type": "string", "description": "المحتوى النصي الكامل المطلوب كتابته، مثل نص SRT كاملاً"},
-            "ext": {"type": "string", "description": "امتداد الملف الناتج، مثل srt أو txt", "default": "srt"},
+            "content": {"type": "string"},
+            "ext": {"type": "string", "default": "srt"},
         }, "required": ["content"]},
     }},
 ])
 
+
 # ══════════════════════════════════════════════════════════
-# نقاط النهاية العامة (Endpoints)
+# Pydantic models
 # ══════════════════════════════════════════════════════════
 class CallRequest(BaseModel):
     tool: str
     arguments: Dict[str, Any] = Field(default_factory=dict)
 
+
 class SuperAgentToggleRequest(BaseModel):
     enabled: bool
+
 
 def _check_auth(x_api_key: str) -> None:
     if APP_SECRET and x_api_key != APP_SECRET:
         raise HTTPException(401, "غير مصرح: مفتاح API غير صحيح أو مفقود (X-API-Key)")
 
+
+# ══════════════════════════════════════════════════════════
+# Endpoints
+# ══════════════════════════════════════════════════════════
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "9Router Tools Server", "tools_count": len(TOOLS_MANIFEST)}
+
 
 @app.get("/health")
 async def health():
@@ -1130,18 +1320,18 @@ async def health():
         "status": "ok",
         "firecrawl_configured": bool(FIRECRAWL_API_KEY),
         "context7_configured": bool(CONTEXT7_API_KEY),
-        "composio_configured": bool(COMPOSIO_API_KEY),
+        "composio_configured": bool(_get_composio_api_key()),
         "auth_enforced": bool(APP_SECRET),
         "video_mcp_connected": bool(video_session),
         "video_tools_count": len(video_tool_names),
         "hub_ready": True,
         "hub_servers": len(registry.servers) if hasattr(registry, 'servers') else 0,
         "super_agent_enabled": is_super_agent_enabled(),
+        "files_isolation": True,
+        "space_base_url_set": bool(SPACE_BASE_URL),
     }
 
-# ══════════════════════════════════════════════════════════
-# ★ ★ ★ نقاط نهاية "الوكيل الخارق" ★ ★ ★
-# ══════════════════════════════════════════════════════════
+
 @app.get("/super-agent/status")
 async def super_agent_status(x_api_key: str = Header(default="")):
     _check_auth(x_api_key)
@@ -1155,21 +1345,20 @@ async def super_agent_status(x_api_key: str = Header(default="")):
         "total_tools_count": builtin_count + hub_count,
     }
 
+
 @app.post("/super-agent/toggle")
 async def super_agent_toggle(req: SuperAgentToggleRequest, x_api_key: str = Header(default="")):
-    """
-    تفعيل enabled=true أو تعطيل enabled=false لكل الأدوات دفعة واحدة (نسخة JSON body — للاستخدام البرمجي).
-    """
     _check_auth(x_api_key)
     summary = set_super_agent_enabled(req.enabled)
     return {"ok": True, **summary}
 
-# ★ ★ ★ نسختان مبسّطتان بـ GET (بدون body) — سهلتا الاستدعاء من رابط مباشر أو زر ★ ★ ★
+
 @app.get("/super-agent/enable")
 async def super_agent_enable(x_api_key: str = Header(default="")):
     _check_auth(x_api_key)
     summary = set_super_agent_enabled(True)
     return {"ok": True, **summary}
+
 
 @app.get("/super-agent/disable")
 async def super_agent_disable(x_api_key: str = Header(default="")):
@@ -1177,7 +1366,7 @@ async def super_agent_disable(x_api_key: str = Header(default="")):
     summary = set_super_agent_enabled(False)
     return {"ok": True, **summary}
 
-# ★ ★ ★ صفحة بها زرّان فعليان: "تفعيل الكل" و "تعطيل الكل" ★ ★ ★
+
 @app.get("/super-agent", response_class=HTMLResponse)
 async def super_agent_page():
     return """
@@ -1216,26 +1405,21 @@ async def super_agent_page():
     </body></html>
     """
 
-# ══════════════════════════════════════════════════════════
-# ✅ التعديل الجراحي: إزالة تكرار الأدوات من registry.tool_routes
-# + احترام مفتاح الوكيل الخارق: لا نُرجع أي أداة إن كان معطّلاً
-# ══════════════════════════════════════════════════════════
+
 @app.get("/tools")
 async def list_tools():
     if not is_super_agent_enabled():
         return {
             "tools": [],
             "super_agent_enabled": False,
-            "message": "الوكيل الخارق معطّل حالياً — تم إيقاف جميع الأدوات. فعّله عبر /super-agent/toggle.",
+            "message": "الوكيل الخارق معطّل — فعّله عبر /super-agent/toggle.",
         }
 
-    # نبدأ بقائمة TOOLS_MANIFEST (نسخة main.py)
     all_tools = list(TOOLS_MANIFEST)
-    seen_names = {t["function"]["name"] for t in all_tools}  # تتبع الأسماء المسجلة
+    seen_names = {t["function"]["name"] for t in all_tools}
 
     if hasattr(registry, "tool_routes"):
         for tool_name, route in registry.tool_routes.items():
-            # إذا كان الاسم موجوداً بالفعل في TOOLS_MANIFEST، نتجاوز نسخة hub.py
             if tool_name in seen_names:
                 continue
             try:
@@ -1253,7 +1437,7 @@ async def list_tools():
 
     return {"tools": all_tools, "super_agent_enabled": True}
 
-# ✅ صفحة الإغلاق التلقائي لـ OAuth
+
 @app.get("/oauth-callback-close")
 async def oauth_callback_close():
     html_content = """
@@ -1262,14 +1446,11 @@ async def oauth_callback_close():
     <body style="font-family:sans-serif;text-align:center;padding-top:50px;">
         <h2>✅ تم الربط بنجاح</h2>
         <p>يمكنك إغلاق هذه النافذة الآن.</p>
-        <script>
-            setTimeout(function() {
-                window.close();
-            }, 1500);
-        </script>
+        <script>setTimeout(function() { window.close(); }, 1500);</script>
     </body></html>
     """
     return HTMLResponse(content=html_content)
+
 
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 
@@ -1280,18 +1461,32 @@ ALLOWED_UPLOAD_EXTS = {
     ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".txt", ".srt",
 }
 
+
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), x_api_key: str = Header(default="")):
+async def upload_file(
+    file: UploadFile = File(...),
+    x_api_key: str = Header(default=""),
+    x_client_id: str = Header(default=""),
+):
     _check_auth(x_api_key)
     orig_ext = Path(file.filename or "").suffix.lower() or ""
     if orig_ext not in ALLOWED_UPLOAD_EXTS:
         raise HTTPException(
             400,
-            f"امتداد الملف '{orig_ext or '(بدون امتداد)'}' غير مسموح به. "
-            f"الامتدادات المسموحة: {', '.join(sorted(ALLOWED_UPLOAD_EXTS))}",
+            f"امتداد الملف '{orig_ext or '(بدون امتداد)'}' غير مسموح. "
+            f"المسموحة: {', '.join(sorted(ALLOWED_UPLOAD_EXTS))}",
         )
+    
+    # ★ عزل الملفات بحسب client_id
+    cid = x_client_id.strip() or (
+        hashlib.sha256(x_api_key.encode()).hexdigest()[:16] if x_api_key else "anonymous"
+    )
+    safe_client = "".join(c for c in cid if c.isalnum() or c in "-_")[:32] or "anonymous"
+    user_dir = FILES_DIR / safe_client
+    user_dir.mkdir(parents=True, exist_ok=True)
+    
     filename = f"{uuid.uuid4().hex}{orig_ext}"
-    dest = FILES_DIR / filename
+    dest = user_dir / filename
     size = 0
     try:
         with open(dest, "wb") as out:
@@ -1305,48 +1500,74 @@ async def upload_file(file: UploadFile = File(...), x_api_key: str = Header(defa
                     dest.unlink(missing_ok=True)
                     raise HTTPException(
                         413,
-                        f"الملف أكبر من الحد المسموح ({MAX_UPLOAD_BYTES // (1024 * 1024)}MB)",
+                        f"الملف أكبر من الحد ({MAX_UPLOAD_BYTES // (1024 * 1024)}MB)",
                     )
                 out.write(chunk)
     except HTTPException:
         raise
     except Exception as e:
         dest.unlink(missing_ok=True)
-        raise HTTPException(500, f"فشل حفظ الملف المرفوع: {e}")
+        raise HTTPException(500, f"فشل حفظ الملف: {e}")
     finally:
         await file.close()
+    
+    rel = f"/files/{safe_client}/{filename}"
     return {
         "ok": True,
         "filename": filename,
         "original_filename": file.filename,
         "local_path": str(dest),
-        "file_url": f"/files/{filename}",
+        "file_url": _full_file_url(rel),
+        "relative_path": rel,
         "size_bytes": size,
     }
 
+
+@app.post("/composio/disconnect")
+async def composio_disconnect_endpoint(
+    connected_account_id: str,
+    x_api_key: str = Header(default=""),
+):
+    """
+    ★ endpoint برمجي مباشر لتسجيل الخروج من Composio.
+    لا يحتاج وكيل — يمكن استدعاؤه من أي كود خارجي.
+    """
+    _check_auth(x_api_key)
+    return await composio_revoke_account(connected_account_id)
+
+
 @app.post("/call")
-async def call_tool(req: CallRequest, x_api_key: str = Header(default="")):
+async def call_tool(
+    req: CallRequest,
+    x_api_key: str = Header(default=""),
+    x_client_id: str = Header(default=""),
+):
     _check_auth(x_api_key)
 
-    # ★ ★ ★ فحص مفتاح الوكيل الخارق أولاً — قبل أي منطق آخر ★ ★ ★
     if not is_super_agent_enabled():
         raise HTTPException(
             403,
-            "الوكيل الخارق معطّل حالياً — جميع الأدوات (المضمّنة، الفيديو، وأدوات Hub) متوقفة. "
-            "فعّله عبر POST /super-agent/toggle {\"enabled\": true}."
+            "الوكيل الخارق معطّل — فعّله عبر POST /super-agent/toggle {\"enabled\": true}.",
         )
-    
-    # 1. أدوات الفيديو المحلية
+
+    # ★ حساب client_id وضبطه في السياق لتعزيل الملفات
+    client_id = (
+        x_client_id.strip()
+        or (hashlib.sha256(x_api_key.encode()).hexdigest()[:16] if x_api_key else "anonymous")
+    )
+    _current_client_id.set(client_id)
+
+    # 1. أدوات الفيديو
     if req.tool in video_tool_names:
         if not video_session:
-            raise HTTPException(503, "خادم أدوات الفيديو (video-audio-mcp) غير متصل حالياً")
+            raise HTTPException(503, "خادم أدوات الفيديو غير متصل")
         try:
             result_text = await _call_video_tool(req.tool, req.arguments)
             return {"ok": True, "result": result_text}
         except Exception as e:
-            raise HTTPException(500, f"خطأ أثناء تنفيذ أداة الفيديو {req.tool}: {e}")
-    
-    # 2. الأدوات المضمّنة في TOOL_FUNCTIONS
+            raise HTTPException(500, f"خطأ في أداة الفيديو {req.tool}: {e}")
+
+    # 2. الأدوات المضمّنة
     fn = TOOL_FUNCTIONS.get(req.tool)
     if fn:
         try:
@@ -1364,17 +1585,16 @@ async def call_tool(req: CallRequest, x_api_key: str = Header(default="")):
             raise HTTPException(502, f"خطأ من الخدمة الخارجية: HTTP {e.response.status_code} - {detail}")
         except Exception as e:
             raise HTTPException(500, f"خطأ أثناء تنفيذ {req.tool}: {e}")
-    
-    # 3. أدوات Hub (مع سجلات التشخيص)
+
+    # 3. أدوات Hub — مع عزل المستخدمين
     logger.info(f"Incoming tool = {req.tool}")
     logger.info(f"Available routes = {list(registry.tool_routes.keys())}")
-    
+
     if req.tool not in registry.tool_routes:
-        logger.warning(
-            f"Tool '{req.tool}' not found. Available: {list(registry.tool_routes.keys())}"
-        )
-    
-    context = internal_context()
+        logger.warning(f"Tool '{req.tool}' not found. Available: {list(registry.tool_routes.keys())}")
+
+    context = AccessContext(client_id=client_id)
+
     try:
         result = await registry.call_tool(req.tool, req.arguments, context)
         return {"ok": True, "result": result}
@@ -1392,6 +1612,7 @@ async def call_tool(req: CallRequest, x_api_key: str = Header(default="")):
             raise HTTPException(504, error_msg)
         else:
             raise HTTPException(500, f"خطأ في أداة Hub: {error_msg}")
+
 
 # ══════════════════════════════════════════════════════════
 # Main
