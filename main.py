@@ -30,9 +30,10 @@ from typing import Optional, List, Dict, Any
 from urllib.parse import urlparse
 import httpx
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("main")
@@ -471,6 +472,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# ★ FIX: /tools يرجع JSON ضخم (300+ أداة بـ schemas) → ضغط gzip يصغّره بشكل كبير
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 @app.middleware("http")
@@ -1516,6 +1519,81 @@ async def super_agent_page():
     """
 
 
+# ══════════════════════════════════════════════════════════
+# ★ FIX: /tools مضغوط ومخزّن مؤقتاً
+#   الواجهة تقطع الطلب بعد ~10 ثوانٍ (signal timed out). الرد كان ضخماً (300+ أداة)،
+#   والسيرفر يرد 200 لكن الجسم لا يصل في الوقت. نصغّره ونبنيه مرة واحدة.
+#   متغيرات بيئة اختيارية:
+#     TOOLS_DESC_MAX=400           أقصى طول لوصف أدوات الـ hub (0 = بلا اقتطاع)
+#     HIDE_TOOL_PREFIXES=pt__,kino__glitch_   أدوات تُخفى من القائمة فقط (تبقى قابلة للاستدعاء في /call)
+# ══════════════════════════════════════════════════════════
+try:
+    TOOLS_DESC_MAX = int(os.environ.get("TOOLS_DESC_MAX", "400"))
+except ValueError:
+    TOOLS_DESC_MAX = 400
+HIDE_TOOL_PREFIXES = tuple(
+    p.strip() for p in os.environ.get("HIDE_TOOL_PREFIXES", "").split(",") if p.strip()
+)
+_tools_cache: Dict[str, Any] = {"key": None, "body": b""}
+
+
+def _slim_schema(node, is_props: bool = False):
+    """يحذف \"$schema\" و\"title\" (حشو) من JSON Schema دون المساس بأسماء الخصائص."""
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            if not is_props and k in ("$schema", "title"):
+                continue
+            out[k] = _slim_schema(v, is_props=(k == "properties" and not is_props))
+        return out
+    if isinstance(node, list):
+        return [_slim_schema(x) for x in node]
+    return node
+
+
+def _shorten(text: str) -> str:
+    if TOOLS_DESC_MAX and len(text) > TOOLS_DESC_MAX:
+        return text[:TOOLS_DESC_MAX].rstrip() + "…"
+    return text
+
+
+def _build_tools_body() -> bytes:
+    all_tools = list(TOOLS_MANIFEST)
+    seen_names = {t["function"]["name"] for t in all_tools}
+
+    if hasattr(registry, "tool_routes"):
+        for tool_name, route in registry.tool_routes.items():
+            if tool_name in seen_names:
+                continue
+            if HIDE_TOOL_PREFIXES and tool_name.startswith(HIDE_TOOL_PREFIXES):
+                continue
+            # أدوات video-audio-mcp تظهر مرتين (بدون prefix من الاتصال المباشر + video__* من الـ hub):
+            # نخفي نسخة الـ hub من القائمة فقط (تبقى قابلة للاستدعاء) إن كان الاتصال المباشر شغالاً.
+            if video_session and getattr(route, "server_name", "") == "video-audio-mcp":
+                continue
+            try:
+                all_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": _shorten(getattr(route, "description", "") or ""),
+                        "parameters": _slim_schema(
+                            getattr(route, "input_schema", None) or {"type": "object", "properties": {}}
+                        ),
+                    },
+                })
+                seen_names.add(tool_name)
+            except Exception as e:
+                logger.warning(f"Skipping tool {tool_name} due to error: {e}")
+
+    body = json.dumps(
+        {"tools": all_tools, "super_agent_enabled": True},
+        ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+    logger.info(f"📦 /tools payload: {len(body) / 1024:.0f}KB, {len(all_tools)} tools")
+    return body
+
+
 @app.get("/tools")
 async def list_tools():
     if not is_super_agent_enabled():
@@ -1525,27 +1603,15 @@ async def list_tools():
             "message": "الوكيل الخارق معطّل — فعّله عبر /super-agent/toggle.",
         }
 
-    all_tools = list(TOOLS_MANIFEST)
-    seen_names = {t["function"]["name"] for t in all_tools}
-
-    if hasattr(registry, "tool_routes"):
-        for tool_name, route in registry.tool_routes.items():
-            if tool_name in seen_names:
-                continue
-            try:
-                all_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "description": getattr(route, "description", ""),
-                        "parameters": getattr(route, "input_schema", {"type": "object", "properties": {}})
-                    }
-                })
-                seen_names.add(tool_name)
-            except Exception as e:
-                logger.warning(f"Skipping tool {tool_name} due to error: {e}")
-
-    return {"tools": all_tools, "super_agent_enabled": True}
+    key = (
+        len(TOOLS_MANIFEST),
+        len(registry.tool_routes) if hasattr(registry, "tool_routes") else 0,
+        bool(video_session), TOOLS_DESC_MAX, HIDE_TOOL_PREFIXES,
+    )
+    if _tools_cache["key"] != key:
+        _tools_cache["body"] = _build_tools_body()
+        _tools_cache["key"] = key
+    return Response(content=_tools_cache["body"], media_type="application/json")
 
 
 @app.get("/oauth-callback-close")
