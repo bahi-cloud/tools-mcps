@@ -1,1466 +1,1407 @@
-import asyncio
-import json
-import time
-import hashlib
-import re
+# main.py - التعديلات الجراحية النهائية لإصلاح مشكلة user_id + إزالة تكرار الأدوات
+# + إضافة خاصية "الوكيل الخارق" (Super Agent Switch) لتفعيل/تعطيل كل الأدوات دفعة واحدة
 import os
-import ssl
-import sys
-import uuid
-import argparse
+import io
+import json
 import base64
-import urllib.parse
-import urllib.request
-from typing import Optional, List, Dict, Any, Tuple
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-
-from fastapi import FastAPI, HTTPException, Request, Depends
+import ipaddress
+import socket
+import uuid
+import asyncio
+import logging
+import traceback
+import shutil
+from contextlib import asynccontextmanager, AsyncExitStack
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+from urllib.parse import urlparse
+import httpx
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
-import aiosqlite
-import gradio as gr
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger("main")
+logging.basicConfig(level=logging.INFO)
+
+# ══════════════════════════════════════════════════════════
+# استيراد Hub Core مع عرض الخطأ الحقيقي
+# ══════════════════════════════════════════════════════════
+BASE_DIR = Path(__file__).parent
 
 try:
-    import httpx
-    HAS_HTTPX = True
-except ImportError:
-    HAS_HTTPX = False
-
-__version__ = "2.1.0-agent"
-
-# ─── Configuration ────────────────────────────────────────────────────────────
-
-def load_config() -> dict:
-    defaults = {
-        "port": 7860,
-        "host": "0.0.0.0",
-        "retry_attempts": 3,
-        "retry_delay_sec": 2,
-        "request_timeout_sec": 180,
-        "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
-        "default_model": "gemini-3.5-flash",
-        "log_requests": True,
-        "cookie_file": None,
-        "proxy": None,
-        "api_keys": ["sk-gemini"],
-        "rate_limit_per_minute": 20,
-        "cache_ttl_seconds": 3600,
-        "db_path": "cache.db",
-        "cleanup_interval_seconds": 300,
-        # ✅ جديد: إعدادات Agent Loop
-        "agent_max_iterations": 8,        # حد أقصى لدورات الأداة
-        "agent_max_tokens_per_step": 4096, # حد التوكنز لكل خطوة
-    }
-
-    for p in ["./config.json", os.path.expanduser("~/.config/gemini-web2api/config.json")]:
-        if os.path.exists(p):
-            try:
-                with open(p) as f:
-                    defaults.update(json.load(f))
-                print(f"[Config] Loaded: {p}")
-            except Exception as e:
-                print(f"[Config] Error loading {p}: {e}")
-            break
-
-    if os.environ.get("API_KEYS"):
-        defaults["api_keys"] = [k.strip() for k in os.environ["API_KEYS"].split(",") if k.strip()]
-    if os.environ.get("GEMINI_COOKIE"):
-        defaults["_cookie_inline"] = os.environ["GEMINI_COOKIE"]
-    if os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY"):
-        defaults["proxy"] = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-    if os.environ.get("GEMINI_BL"):
-        defaults["gemini_bl"] = os.environ["GEMINI_BL"]
-
-    return defaults
-
-CONFIG = load_config()
-
-# ─── Models ──────────────────────────────────────────────────────────────────
-# ✅ إصلاح: كانت هناك أخطاء syntax (قوس مفقود + تكرار مفاتيح)
-
-MODELS = {
-    "gemini-3.7-flash": {
-        "mode": 1, "think": 4,
-        "desc": "Fast general-purpose model (~12k chars)",
-    },  # ← القوس كان مفقوداً في الكود الأصلي
-    "gemini-3.6-flash": {
-        "mode": 1, "think": 4,
-        "desc": "All-around model (Gemini 3.6 Flash)",
-    },
-    "gemini-3.5-flash": {
-        "mode": 1, "think": 4,
-        "desc": "Standard flash model",
-    },
-    "gemini-3.5-flash-thinking": {
-        "mode": 2, "think": 0,
-        "desc": "Deep thinking mode, longest output (~20k chars)",
-    },
-    "gemini-3.1-pro": {
-        "mode": 3, "think": 4,
-        "desc": "Pro model (requires cookie for real routing)",
-    },
-    "gemini-auto": {
-        "mode": 4, "think": 4,
-        "desc": "Auto model selection",
-    },
-    "gemini-3.5-flash-thinking-lite": {
-        "mode": 5, "think": 0,
-        "desc": "Dynamic thinking with adaptive depth (~15k chars)",
-    },
-    # ✅ إصلاح: كان "claude-opus-4-6" مكرراً بخطأ، والصحيح هو نموذج Gemini خفيف
-    "gemini-flash-lite": {
-        "mode": 6, "think": 4,
-        "desc": "Lightweight fast model (~10k chars)",
-    },
-    "claude-opus-4-6": {
-        "mode": 2, "think": 0,
-        "desc": "Deep thinking mode, longest output (~20k chars)",
-    },
-    "claude-opus-4-5": {
-        "mode": 2, "think": 0,
-        "desc": "Claude Opus 4.5 (mapped to Gemini thinking mode)",
-    },
-    "claude-opus-3-5": {
-        "mode": 2, "think": 0,
-        "desc": "Claude Opus 4.1 (mapped to Gemini thinking mode)",
-    },
-    "claude-opus-4-7": {
-        "mode": 2, "think": 0,
-        "desc": "Claude Opus 4.0 (mapped to Gemini thinking mode)",
-    },
-    "claude-opus-4-8": {
-        "mode": 2, "think": 0,
-        "desc": "Claude Opus 4 (dated alias)",
-    },       
-}
-
-# ─── Pydantic Schemas ─────────────────────────────────────────────────────────
-
-class ChatMessage(BaseModel):
-    role: str
-    content: Any
-    tool_calls: Optional[List[dict]] = None
-    tool_call_id: Optional[str] = None
-    name: Optional[str] = None
-
-class ChatCompletionRequest(BaseModel):
-    model: str = "gemini-3.5-flash"
-    messages: List[ChatMessage]
-    temperature: Optional[float] = 0.7
-    max_tokens: Optional[int] = 32000
-    stream: Optional[bool] = False
-    tools: Optional[List[dict]] = None
-    tool_choice: Optional[Any] = "auto"
-    user: Optional[str] = "default"
-
-# ─── Production Services ──────────────────────────────────────────────────────
-
-@dataclass
-class RateLimitEntry:
-    timestamps: List[float] = field(default_factory=list)
-    last_cleanup: float = field(default_factory=time.time)
-
-class Services:
-    def __init__(self):
-        self._rate_limits: Dict[str, RateLimitEntry] = {}
-        self._lock = asyncio.Lock()
-        self._cleanup_task: Optional[asyncio.Task] = None
-
-    async def init_db(self):
-        async with aiosqlite.connect(CONFIG["db_path"]) as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS cache (
-                    key TEXT PRIMARY KEY,
-                    val TEXT,
-                    exp REAL
-                )
-            """)
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_exp ON cache(exp)")
-            await db.commit()
-
-    async def start_cleanup(self):
-        async def loop():
-            while True:
-                await asyncio.sleep(CONFIG["cleanup_interval_seconds"])
-                await self._cleanup()
-        self._cleanup_task = asyncio.create_task(loop())
-
-    async def _cleanup(self):
-        now = time.time()
-        cutoff = now - 3600
-        async with self._lock:
-            expired = [ip for ip, e in self._rate_limits.items() if e.last_cleanup < cutoff]
-            for ip in expired:
-                del self._rate_limits[ip]
-        try:
-            async with aiosqlite.connect(CONFIG["db_path"]) as db:
-                await db.execute("DELETE FROM cache WHERE exp < ?", (now,))
-                await db.commit()
-        except Exception:
-            pass
-
-    async def check_rate_limit(self, client_id: str) -> Tuple[bool, int]:
-        now = time.time()
-        cutoff = now - 60
-        async with self._lock:
-            if client_id not in self._rate_limits:
-                self._rate_limits[client_id] = RateLimitEntry()
-            entry = self._rate_limits[client_id]
-            entry.timestamps = [t for t in entry.timestamps if t > cutoff]
-            entry.last_cleanup = now
-            limit = CONFIG["rate_limit_per_minute"]
-            if len(entry.timestamps) >= limit:
-                wait = 60 - (now - min(entry.timestamps))
-                return False, int(wait) + 1
-            entry.timestamps.append(now)
-            return True, 0
-
-    async def get_cache(self, key: str) -> Optional[str]:
-        try:
-            async with aiosqlite.connect(CONFIG["db_path"]) as db:
-                async with db.execute(
-                    "SELECT val FROM cache WHERE key=? AND exp>?", (key, time.time())
-                ) as cur:
-                    row = await cur.fetchone()
-                    return row[0] if row else None
-        except Exception:
-            return None
-
-    async def set_cache(self, key: str, value: str):
-        try:
-            async with aiosqlite.connect(CONFIG["db_path"]) as db:
-                await db.execute(
-                    "INSERT OR REPLACE INTO cache VALUES (?, ?, ?)",
-                    (key, value, time.time() + CONFIG["cache_ttl_seconds"])
-                )
-                await db.commit()
-        except Exception:
-            pass
-
-services = Services()
-
-# ─── Logging ──────────────────────────────────────────────────────────────────
-
-def log(msg: str, level: str = "INFO"):
-    if CONFIG.get("log_requests"):
-        prefix = {"INFO": "ℹ️", "AGENT": "🤖", "TOOL": "🔧", "ERROR": "❌", "WARN": "⚠️"}.get(level, "•")
-        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {prefix} {msg}\n")
-        sys.stderr.flush()
-
-# ─── Cookie & Headers ─────────────────────────────────────────────────────────
-
-def load_cookie() -> Tuple[str, Optional[str]]:
-    inline = CONFIG.get("_cookie_inline", "")
-    if inline:
-        if inline.startswith("{"):
-            try:
-                data = json.loads(inline)
-                return data.get("cookie", ""), data.get("sapisid") or None
-            except Exception:
-                pass
-        pairs = dict(p.split("=", 1) for p in inline.split("; ") if "=" in p)
-        return inline, pairs.get("SAPISID") or None
-
-    cookie_file = CONFIG.get("cookie_file")
-    if not cookie_file or not os.path.exists(cookie_file):
-        return "", None
-    try:
-        with open(cookie_file) as f:
-            content = f.read().strip()
-        if content.startswith("{"):
-            data = json.loads(content)
-            return data.get("cookie", ""), data.get("sapisid") or None
-        pairs = dict(p.split("=", 1) for p in content.split("; ") if "=" in p)
-        return content, pairs.get("SAPISID") or None
-    except Exception as e:
-        log(f"Cookie load error: {e}", "ERROR")
-        return "", None
-
-def make_sapisidhash(sapisid: str) -> str:
-    ts = int(time.time())
-    h = hashlib.sha1(f"{ts} {sapisid} https://gemini.google.com".encode()).hexdigest()
-    return f"SAPISIDHASH {ts}_{h}"
-
-def _build_headers() -> dict:
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://gemini.google.com",
-        "Referer": "https://gemini.google.com/app",
-        "X-Same-Domain": "1",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-    }
-    cookie_str, sapisid = load_cookie()
-    if cookie_str:
-        headers["Cookie"] = cookie_str
-    if sapisid:
-        headers["Authorization"] = make_sapisidhash(sapisid)
-    return headers
-
-# ─── Gemini Protocol ──────────────────────────────────────────────────────────
-
-def _build_gemini_payload(prompt: str, model_id: int, think_mode: int) -> Tuple[bytes, str]:
-    inner = [None] * 80
-    inner[0] = [prompt, 0, None, None, None, None, 0]
-    inner[1] = ["en"]
-    inner[2] = ["", "", "", None, None, None, None, None, None, ""]
-    inner[6] = [0]
-    inner[7] = 1
-    inner[10] = 1
-    inner[11] = 0
-    inner[17] = [[think_mode]]
-    inner[18] = 0
-    inner[27] = 1
-    inner[30] = [4]
-    inner[41] = [2]
-    inner[53] = 0
-    inner[59] = str(uuid.uuid4())
-    inner[61] = []
-    inner[68] = 1
-    inner[79] = model_id
-
-    outer = [None, json.dumps(inner)]
-    body = urllib.parse.urlencode({"f.req": json.dumps(outer)}).encode()
-    reqid = int(time.time()) % 1000000
-    url = (
-        "https://gemini.google.com/_/BardChatUi/data/"
-        "assistant.lamda.BardFrontendService/StreamGenerate"
-        f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
-    )
-    return body, url
-
-def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
-    body, url = _build_gemini_payload(prompt, model_id, think_mode)
-    headers = _build_headers()
-    proxy = CONFIG.get("proxy")
-    last_err = None
-
-    for attempt in range(CONFIG["retry_attempts"]):
-        try:
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            ctx = ssl.create_default_context()
-            if proxy:
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                    urllib.request.HTTPSHandler(context=ctx)
-                )
-                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
-            else:
-                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            return resp.read().decode("utf-8", errors="replace")
-        except Exception as e:
-            last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}", "WARN")
-                time.sleep(CONFIG["retry_delay_sec"])
-
-    raise last_err
-
-def clean_gemini_text(text: str) -> str:
-    text = re.sub(
-        r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
-        '', text, flags=re.DOTALL
-    )
-    return text.strip()
-
-def extract_response_text(raw: str) -> str:
-    texts = []
-    for line in raw.split("\n"):
-        if '"wrb.fr"' not in line or len(line) < 200:
-            continue
-        try:
-            arr = json.loads(line)
-            inner_str = arr[0][2]
-            if not inner_str or len(inner_str) < 50:
-                continue
-            inner = json.loads(inner_str)
-            if isinstance(inner, list) and len(inner) > 4 and inner[4]:
-                for part in inner[4]:
-                    if isinstance(part, list) and len(part) > 1 and part[1]:
-                        if isinstance(part[1], list):
-                            for t in part[1]:
-                                if isinstance(t, str) and len(t) > 0:
-                                    texts.append(t)
-        except (json.JSONDecodeError, IndexError, TypeError):
-            pass
-
-    text = ""
-    for t in reversed(texts):
-        if t.strip():
-            text = t
-            break
-    return clean_gemini_text(text)
-
-def gemini_stream_iter(prompt: str, model_id: int, think_mode: int):
-    """Streaming حقيقي يُعيد النص تدريجياً."""
-    body_bytes, url = _build_gemini_payload(prompt, model_id, think_mode)
-    body_str = body_bytes.decode()
-    headers = _build_headers()
-    proxy = CONFIG.get("proxy")
-
-    if not HAS_HTTPX:
-        raw = gemini_stream_generate(prompt, model_id, think_mode)
-        text = extract_response_text(raw)
-        if text:
-            yield text
-        return
-
-    prev_text = ""
-    transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-
-    with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
-        with client.stream("POST", url, content=body_str, headers=headers) as resp:
-            buf = ""
-            for chunk in resp.iter_text():
-                buf += chunk
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    if '"wrb.fr"' not in line or len(line) < 200:
-                        continue
-                    try:
-                        arr = json.loads(line)
-                        inner_str = arr[0][2]
-                        if not inner_str or len(inner_str) < 50:
-                            continue
-                        inner2 = json.loads(inner_str)
-                        if isinstance(inner2, list) and len(inner2) > 4 and inner2[4]:
-                            for part in inner2[4]:
-                                if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
-                                    for t in part[1]:
-                                        if isinstance(t, str) and len(t) > len(prev_text):
-                                            delta = t[len(prev_text):]
-                                            delta = clean_gemini_text(delta)
-                                            if delta:
-                                                yield delta
-                                            prev_text = t
-                    except (json.JSONDecodeError, IndexError, TypeError):
-                        pass
-
-# ─── ✅ Tool Call Parser المحسّن ──────────────────────────────────────────────
-
-def parse_tool_calls(text: str) -> Tuple[str, Optional[List[dict]]]:
-    """
-    محلّل Tool Calls متعدد المستويات:
-    1. ```tool_call {...}```
-    2. ```json {"name": ..., "arguments": ...}```
-    3. <tool_call>...</tool_call>
-    4. JSON مباشر في النص
-    """
-    tool_calls = []
-
-    # ─── مستوى 1: ```tool_call``` blocks
-    pattern1 = r'```tool_call\s*\n(.*?)\n?```'
-    for match in re.finditer(pattern1, text, re.DOTALL):
-        raw = match.group(1).strip()
-        tc = _try_parse_single_tool_call(raw)
-        if tc:
-            tool_calls.append(tc)
-
-    # ─── مستوى 2: ```json``` blocks التي تحتوي على tool call
-    if not tool_calls:
-        pattern2 = r'```json\s*\n(.*?)\n?```'
-        for match in re.finditer(pattern2, text, re.DOTALL):
-            raw = match.group(1).strip()
-            tc = _try_parse_single_tool_call(raw)
-            if tc:
-                tool_calls.append(tc)
-
-    # ─── مستوى 3: XML-style <tool_call>
-    if not tool_calls:
-        pattern3 = r'<tool_call>(.*?)</tool_call>'
-        for match in re.finditer(pattern3, text, re.DOTALL):
-            raw = match.group(1).strip()
-            tc = _try_parse_single_tool_call(raw)
-            if tc:
-                tool_calls.append(tc)
-
-    # ─── مستوى 4: JSON مباشر (للنماذج التي تُخرج JSON مباشرة)
-    if not tool_calls:
-        # ابحث عن JSON objects تحتوي على "name" و "arguments"
-        json_pattern = r'\{[^{}]*"name"\s*:\s*"[^"]+[^{}]*"arguments"\s*:[^{}]*\}'
-        for match in re.finditer(json_pattern, text, re.DOTALL):
-            tc = _try_parse_single_tool_call(match.group(0))
-            if tc:
-                tool_calls.append(tc)
-
-    if not tool_calls:
-        return text, None
-
-    # تنظيف النص من أجزاء tool calls
-    clean = re.sub(pattern1, '', text, flags=re.DOTALL)
-    clean = re.sub(r'```json\s*\n.*?\n?```', '', clean, flags=re.DOTALL)
-    clean = re.sub(r'<tool_call>.*?</tool_call>', '', clean, flags=re.DOTALL)
-    # إزالة أي JSON مباشر كان tool call
-    for tc_obj in tool_calls:
-        fn_name = tc_obj["function"]["name"]
-        clean = re.sub(
-            r'\{[^{}]*"name"\s*:\s*"' + re.escape(fn_name) + r'"[^{}]*\}',
-            '', clean
-        )
-
-    return clean.strip(), tool_calls
-
-def _try_parse_single_tool_call(raw: str) -> Optional[dict]:
-    """محاولة تحليل tool call واحد من نص."""
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        # محاولة إصلاح JSON المكسور
-        raw_fixed = _fix_json(raw)
-        try:
-            data = json.loads(raw_fixed)
-        except json.JSONDecodeError:
-            return None
-
-    if not isinstance(data, dict):
-        return None
-
-    name = data.get("name") or data.get("function") or data.get("tool")
-    if not name:
-        return None
-
-    args = data.get("arguments") or data.get("parameters") or data.get("args") or {}
-    if isinstance(args, str):
-        try:
-            args = json.loads(args)
-        except Exception:
-            args = {"value": args}
-
-    return {
-        "id": f"call_{uuid.uuid4().hex[:8]}",
-        "type": "function",
-        "function": {
-            "name": name,
-            "arguments": json.dumps(args, ensure_ascii=False),
-        },
-    }
-
-def _fix_json(s: str) -> str:
-    """إصلاح JSON المكسور جزئياً."""
-    # إزالة trailing commas
-    s = re.sub(r',\s*([}\]])', r'\1', s)
-    # إضافة quotes للمفاتيح غير المُقتبَسة
-    s = re.sub(r'(\w+)\s*:', r'"\1":', s)
-    # إزالة double quotes
-    s = re.sub(r'""(\w+)""', r'"\1"', s)
-    return s
-
-# ─── ✅ Tool/Agent System Prompt المحسّن ──────────────────────────────────────
-
-AGENT_SYSTEM_PROMPT = """You are a helpful AI assistant with access to tools. You MUST use tools when they are needed to answer the user's request accurately.
-## HOW TO USE TOOLS
-When you need to call a tool, you MUST respond with a tool_call block in this EXACT format:
-```tool_call
-{"name": "tool_name_here", "arguments": {"param1": "value1", "param2": "value2"}}
-```
-## IMPORTANT RULES
-1. **Always use tools when available** - Do not guess or make up information that a tool can provide.
-2. **One tool at a time** - Call tools one by one unless you need multiple simultaneously.
-3. **Wait for results** - After calling a tool, wait for the tool result before continuing.
-4. **Use results** - Incorporate tool results into your final answer.
-5. **Be explicit** - Always explain what tool you're calling and why.
-## AVAILABLE TOOLS
-{tool_definitions}
-## RESPONSE FORMAT
-- If you need a tool: respond with ONLY the tool_call block (no extra text before it).
-- If you have all information needed: provide your final answer directly.
-- Never call a tool you don't have access to.
-- Never fabricate tool results.
-## EXAMPLE
-User: What's the weather in Paris?
-Assistant:
-```tool_call
-{"name": "get_weather", "arguments": {"location": "Paris", "unit": "celsius"}}
-```
-[After receiving tool result]
-Assistant: Based on the weather data, Paris currently has...
-"""
-
-def build_tool_definitions_text(tools: List[dict]) -> str:
-    """بناء وصف نصي للأدوات المتاحة."""
-    if not tools:
-        return "No tools available."
-    lines = []
-    for i, tool in enumerate(tools, 1):
-        if tool.get("type") == "function":
-            fn = tool.get("function", tool)
-        else:
-            fn = tool
-        name = fn.get("name", f"tool_{i}")
-        desc = fn.get("description", "No description")
-        params = fn.get("parameters", {})
-
-        lines.append(f"### {i}. `{name}`")
-        lines.append(f"**Description:** {desc}")
-
-        if params and params.get("properties"):
-            lines.append("**Parameters:**")
-            for pname, pinfo in params.get("properties", {}).items():
-                required = pname in params.get("required", [])
-                ptype = pinfo.get("type", "any")
-                pdesc = pinfo.get("description", "")
-                req_str = " *(required)*" if required else " *(optional)*"
-                lines.append(f"  - `{pname}` ({ptype}){req_str}: {pdesc}")
-        lines.append("")
-    return "\n".join(lines)
-
-# ─── Prompt Builder ───────────────────────────────────────────────────────────
-
-def messages_to_prompt(messages: list, tools: list = None) -> str:
-    """
-    ✅ محسّن: يبني prompt واضحاً مع system prompt قوي للأدوات.
-    """
-    parts = []
-
-    # ─── System prompt للأدوات
-    if tools:
-        tool_defs_text = build_tool_definitions_text(tools)
-        system_tool_prompt = AGENT_SYSTEM_PROMPT.replace("{tool_definitions}", tool_defs_text)
-        parts.append(f"[SYSTEM]\n{system_tool_prompt}")
-
-    # ─── معالجة الرسائل
-    for msg in messages:
-        role = msg.get("role", "user") if isinstance(msg, dict) else msg.role
-        content = msg.get("content", "") if isinstance(msg, dict) else (msg.content or "")
-        tool_calls_data = (msg.get("tool_calls") if isinstance(msg, dict)
-                          else getattr(msg, "tool_calls", None))
-
-        # تحويل content متعدد الأجزاء
-        if isinstance(content, list):
-            content = " ".join(
-                c.get("text", "") for c in content
-                if isinstance(c, dict) and c.get("type") in ("text", "input_text")
-            )
-
-        if role == "system":
-            if not tools:  # إذا كان هناك أدوات، system prompt الأدوات يأتي أولاً
-                parts.append(f"[SYSTEM]\n{content}")
-            else:
-                # دمج system prompt المستخدم مع system prompt الأدوات
-                parts[0] = parts[0] + f"\n\n## ADDITIONAL INSTRUCTIONS\n{content}"
-
-        elif role == "assistant":
-            if tool_calls_data:
-                # تضمين tool calls السابقة في السياق
-                tc_parts = [f"[ASSISTANT called tool(s)]:"]
-                for tc in tool_calls_data:
-                    fn = tc.get("function", {})
-                    tc_parts.append(
-                        f"```tool_call\n"
-                        f"{json.dumps({'name': fn.get('name'), 'arguments': json.loads(fn.get('arguments', '{}'))}, ensure_ascii=False)}\n"
-                        f"```"
-                    )
-                if content:
-                    tc_parts.insert(1, f"[ASSISTANT]: {content}")
-                parts.append("\n".join(tc_parts))
-            else:
-                parts.append(f"[ASSISTANT]: {content}")
-
-        elif role == "tool":
-            # ✅ نتائج الأدوات بشكل واضح
-            tool_name = (msg.get("name", "") if isinstance(msg, dict)
-                        else getattr(msg, "name", ""))
-            tool_call_id = (msg.get("tool_call_id", "") if isinstance(msg, dict)
-                           else getattr(msg, "tool_call_id", ""))
-            parts.append(
-                f"[TOOL RESULT - {tool_name or tool_call_id}]:\n```json\n{content}\n```\n"
-                f"Now use this result to continue."
-            )
-
-        else:  # user
-            if content:
-                parts.append(f"[USER]: {content}")
-
-    return "\n\n".join(p for p in parts if p)
-
-# ─── ✅ Agent Loop الرئيسي ────────────────────────────────────────────────────
-
-def run_agent_sync(
-    messages: List[dict],
-    model_id: int,
-    think_mode: int,
-    tools: Optional[List[dict]],
-    max_iterations: int = None,
-) -> Tuple[str, Optional[List[dict]], List[dict]]:
-    """
-    Agent Loop حقيقي (ReAct pattern):
-    1. ابنِ prompt من السياق الكامل
-    2. اسأل Gemini
-    3. إذا أعاد tool call → أضف إلى السياق واعد
-    4. إذا لم يُعد tool call → أعد الرد النهائي
-    يعيد: (final_text, final_tool_calls, updated_messages)
-    """
-    if max_iterations is None:
-        max_iterations = CONFIG["agent_max_iterations"]
-
-    current_messages = list(messages)
-    iteration = 0
-    last_tool_calls = None
-
-    while iteration < max_iterations:
-        iteration += 1
-        log(f"Agent iteration {iteration}/{max_iterations}", "AGENT")
-
-        prompt = messages_to_prompt(current_messages, tools if iteration == 1 else tools)
-        raw = gemini_stream_generate(prompt, model_id, think_mode)
-        text = extract_response_text(raw)
-
-        if not text:
-            log("Empty response from Gemini", "WARN")
-            break
-
-        # ─── محاولة تحليل tool calls
-        clean_text, tool_calls = parse_tool_calls(text)
-
-        if tool_calls and tools:
-            log(f"Tool calls detected: {[tc['function']['name'] for tc in tool_calls]}", "TOOL")
-
-            # أضف رد المساعد مع tool calls إلى السياق
-            current_messages.append({
-                "role": "assistant",
-                "content": clean_text or None,
-                "tool_calls": tool_calls,
-            })
-            last_tool_calls = tool_calls
-
-            # ✅ هنا يجب على المستدعي تنفيذ الأدوات وإضافة النتائج
-            # في وضع non-streaming، نُعيد tool calls للمستدعي
-            # في وضع agent داخلي، نضيف placeholder
-            return clean_text, tool_calls, current_messages
-
-        else:
-            # ─── رد نهائي بدون tool calls
-            log(f"Final response after {iteration} iterations", "AGENT")
-            return clean_text or text, None, current_messages
-
-    log(f"Max iterations ({max_iterations}) reached", "WARN")
-    return text or "", None, current_messages
-
-
-def run_agent_with_tool_execution_sync(
-    messages: List[dict],
-    model_id: int,
-    think_mode: int,
-    tools: Optional[List[dict]],
-    tool_executor=None,  # دالة لتنفيذ الأدوات (اختيارية)
-    max_iterations: int = None,
-) -> Tuple[str, Optional[List[dict]], List[dict]]:
-    """
-    ✅ Agent Loop الكامل مع تنفيذ الأدوات تلقائياً (إذا توفّر executor).
+    from hub import create_services, AccessContext
+    logger.info("✅ تم استيراد hub.py بنجاح.")
+    registry, auth = create_services()
+except Exception as e:
+    logger.error(f"❌ فشل استيراد hub.py: {e}")
+    traceback.print_exc()
     
-    tool_executor: Callable[[str, dict], str] - يأخذ (tool_name, args) ويُعيد نتيجة نصية
-    """
-    if max_iterations is None:
-        max_iterations = CONFIG["agent_max_iterations"]
-
-    current_messages = list(messages)
-
-    for iteration in range(1, max_iterations + 1):
-        log(f"Agent loop iteration {iteration}/{max_iterations}", "AGENT")
-
-        prompt = messages_to_prompt(current_messages, tools)
-        try:
-            raw = gemini_stream_generate(prompt, model_id, think_mode)
-            text = extract_response_text(raw)
-        except Exception as e:
-            log(f"Gemini call failed: {e}", "ERROR")
-            return f"Error: {e}", None, current_messages
-
-        if not text:
-            log("Empty response", "WARN")
-            break
-
-        clean_text, tool_calls = parse_tool_calls(text)
-
-        if not tool_calls or not tools:
-            # رد نهائي
-            log(f"✅ Final answer after {iteration} iterations", "AGENT")
-            return clean_text or text, None, current_messages
-
-        # ─── أضف رد المساعد
-        current_messages.append({
-            "role": "assistant",
-            "content": clean_text or None,
-            "tool_calls": tool_calls,
-        })
-
-        # ─── تنفيذ كل tool call
-        for tc in tool_calls:
-            fn_name = tc["function"]["name"]
-            try:
-                fn_args = json.loads(tc["function"]["arguments"])
-            except Exception:
-                fn_args = {}
-
-            log(f"Executing tool: {fn_name}({fn_args})", "TOOL")
-
-            if tool_executor:
-                try:
-                    result = tool_executor(fn_name, fn_args)
-                    result_str = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
-                except Exception as e:
-                    result_str = json.dumps({"error": str(e)})
-                    log(f"Tool execution error: {e}", "ERROR")
-            else:
-                # لا يوجد executor، أضف placeholder
-                result_str = json.dumps({"status": "tool_executed", "note": "No executor provided"})
-
-            current_messages.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "name": fn_name,
-                "content": result_str,
-            })
-
-        log(f"Tools executed, continuing loop...", "AGENT")
-
-    log(f"Max iterations reached", "WARN")
-    return text or "", None, current_messages
-
-
-# ─── Sync wrapper ─────────────────────────────────────────────────────────────
-
-def call_gemini_sync(
-    prompt: str, model_id: int, think_mode: int, tools: list = None
-) -> Tuple[str, Optional[list]]:
-    """استدعاء مزامن بسيط (بدون agent loop)."""
-    raw = gemini_stream_generate(prompt, model_id, think_mode)
-    text = extract_response_text(raw)
-    tool_calls = None
-    if tools and text:
-        text, tool_calls = parse_tool_calls(text)
-    return text or "", tool_calls
-
-# ─── Model Resolution ─────────────────────────────────────────────────────────
-
-def resolve_model(model_name: str) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[str]]:
-    think_override = None
-    if "@think=" in model_name:
-        model_name, think_str = model_name.rsplit("@think=", 1)
-        try:
-            think_override = int(think_str)
-        except ValueError:
+    class AccessContext:
+        def __init__(self, client_id="internal", allowed_servers=None, allowed_domains=None, allowed_tags=None, allowed_tools=None):
+            self.client_id = client_id
+            self.allowed_servers = allowed_servers
+            self.allowed_domains = allowed_domains
+            self.allowed_tags = allowed_tags
+            self.allowed_tools = allowed_tools
+    
+    class MockRegistry:
+        async def startup_from_config(self):
+            return {"started": [], "errors": {}}
+        async def shutdown(self):
             pass
-    cfg = MODELS.get(model_name)
-    if not cfg:
-        # fallback للنموذج الافتراضي بدلاً من الخطأ المباشر
-        default = CONFIG.get("default_model", "gemini-3.5-flash")
-        cfg = MODELS.get(default)
-        if cfg:
-            log(f"Unknown model '{model_name}', falling back to '{default}'", "WARN")
-            model_name = default
-        else:
-            return None, None, None, f"Unknown model: {model_name}. Available: {list(MODELS.keys())}"
-    return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
+        async def call_tool(self, tool_name, arguments, context):
+            return {"error": f"Tool '{tool_name}' not found"}
+        @property
+        def servers(self):
+            return {}
+        @property
+        def tool_routes(self):
+            return {}
+    
+    class MockAuth:
+        async def reload(self):
+            pass
+    
+    registry = MockRegistry()
+    auth = MockAuth()
 
-# ─── Authentication ───────────────────────────────────────────────────────────
+def internal_context():
+    return AccessContext(client_id="internal")
 
-security = HTTPBearer(auto_error=False)
+# ══════════════════════════════════════════════════════════
+# إعداد عام وتكوين البيئة
+# ══════════════════════════════════════════════════════════
+FILES_DIR = BASE_DIR / "files"
+FILES_DIR.mkdir(exist_ok=True)
 
-async def verify_api_key(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
-) -> str:
-    api_keys = CONFIG.get("api_keys", [])
-    if not api_keys:
-        return "anonymous"
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    token = credentials.credentials
-    if token not in api_keys:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return token
+FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY", "")
+CONTEXT7_API_KEY = os.environ.get("CONTEXT7_API_KEY", "")
+COMPOSIO_API_KEY = os.environ.get("COMPOSIO_API_KEY", "")
+COMPOSIO_DEFAULT_USER_ID = os.environ.get("COMPOSIO_DEFAULT_USER_ID", "default")
+COMPOSIO_BASE_URL = "https://backend.composio.dev/api/v3"
+COMPOSIO_BASE_URL_V31 = "https://backend.composio.dev/api/v3.1"
+APP_SECRET = os.environ.get("APP_SECRET", "")
+SPACE_BASE_URL = os.environ.get("SPACE_BASE_URL", "")
 
-# ─── FastAPI App ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+# ★ ★ ★ الوكيل الخارق (Super Agent Switch) ★ ★ ★
+# مفتاح واحد يفعّل أو يعطّل كل الأدوات دفعة واحدة (المضمّنة + أدوات الفيديو + أدوات Hub)
+# ══════════════════════════════════════════════════════════
+STATE_DIR = BASE_DIR / "state"
+STATE_DIR.mkdir(exist_ok=True)
+SUPER_AGENT_STATE_FILE = STATE_DIR / "super_agent.json"
 
+# القيمة الافتراضية: كل الأدوات مفعّلة
+_super_agent_enabled: bool = True
+
+def _load_super_agent_state() -> None:
+    """تحميل حالة الوكيل الخارق من القرص عند بدء التشغيل (لتبقى الحالة محفوظة بعد إعادة التشغيل)."""
+    global _super_agent_enabled
+    try:
+        if SUPER_AGENT_STATE_FILE.exists():
+            data = json.loads(SUPER_AGENT_STATE_FILE.read_text(encoding="utf-8"))
+            _super_agent_enabled = bool(data.get("enabled", True))
+            logger.info(f"🔌 تم تحميل حالة الوكيل الخارق من القرص: enabled={_super_agent_enabled}")
+    except Exception as e:
+        logger.warning(f"تعذّر تحميل حالة الوكيل الخارق، سيتم استخدام القيمة الافتراضية (مفعّل): {e}")
+        _super_agent_enabled = True
+
+def _save_super_agent_state() -> None:
+    try:
+        SUPER_AGENT_STATE_FILE.write_text(
+            json.dumps({"enabled": _super_agent_enabled}, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning(f"تعذّر حفظ حالة الوكيل الخارق على القرص: {e}")
+
+def is_super_agent_enabled() -> bool:
+    return _super_agent_enabled
+
+def set_super_agent_enabled(enabled: bool) -> Dict[str, Any]:
+    """تفعيل/تعطيل كل الأدوات دفعة واحدة. تُرجع ملخصاً بعدد الأدوات المتأثرة."""
+    global _super_agent_enabled
+    _super_agent_enabled = bool(enabled)
+    _save_super_agent_state()
+
+    builtin_count = len(TOOLS_MANIFEST) if "TOOLS_MANIFEST" in globals() else 0
+    video_count = len(video_tool_names)
+    hub_count = len(registry.tool_routes) if hasattr(registry, "tool_routes") else 0
+
+    logger.info(
+        f"🔁 تم {'تفعيل' if _super_agent_enabled else 'تعطيل'} الوكيل الخارق — "
+        f"الأدوات المضمّنة={builtin_count}، أدوات الفيديو={video_count}، أدوات Hub={hub_count}"
+    )
+    return {
+        "enabled": _super_agent_enabled,
+        "affected_tools_count": builtin_count + video_count + hub_count,
+        "builtin_tools_count": builtin_count,
+        "video_tools_count": video_count,
+        "hub_tools_count": hub_count,
+    }
+
+# ══════════════════════════════════════════════════════════
+# ★ ★ ★ تعريف TOOLS_MANIFEST (قبل استخدامه في _connect_video_mcp) ★ ★ ★
+# ══════════════════════════════════════════════════════════
+TOOLS_MANIFEST = [
+    # سيتم إضافة أدوات الفيديو لاحقاً في _connect_video_mcp
+]
+
+# ══════════════════════════════════════════════════════════
+# الاتصال بخادم أدوات الفيديو/الصوت
+# ══════════════════════════════════════════════════════════
+VIDEO_MCP_SCRIPT = BASE_DIR / "video-audio-mcp" / "server.py"
+
+video_session: Optional[Any] = None
+video_tool_names: set = set()
+video_tool_schemas: Dict[str, dict] = {}
+_video_exit_stack: Optional[AsyncExitStack] = None
+
+async def _connect_video_mcp() -> None:
+    global video_session, video_tool_names, _video_exit_stack
+    if not VIDEO_MCP_SCRIPT.exists():
+        logger.warning("video-audio-mcp/server.py غير موجود على القرص — سيتم تخطي أدوات الفيديو")
+        return
+    try:
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+    except ImportError:
+        logger.warning("حزمة mcp غير مثبّتة — سيتم تخطي أدوات الفيديو")
+        return
+    try:
+        _video_exit_stack = AsyncExitStack()
+        params = StdioServerParameters(command="python", args=[str(VIDEO_MCP_SCRIPT)])
+        read, write = await _video_exit_stack.enter_async_context(stdio_client(params))
+        session = await _video_exit_stack.enter_async_context(ClientSession(read, write))
+        await session.initialize()
+        listed = await session.list_tools()
+        for t in listed.tools:
+            schema = t.inputSchema or {"type": "object", "properties": {}}
+            desc = (t.description or "").strip()
+            desc += (
+                "\n\n[ملاحظة مهمة]: هذه أداة فيديو/صوت تعمل على مسارات ملفات محلية "
+                "على الخادم فقط. استخدم fetch_media_to_file أولاً لتنزيل أي رابط "
+                "خارجي إلى مسار محلي، واكتب المخرجات دائماً داخل مجلد "
+                "/app/files/<اسم-فريد>.<امتداد> ليصبح الملف قابلاً للتحميل عبر "
+                "/files/<اسم-الملف>."
+            )
+            TOOLS_MANIFEST.append({
+                "type": "function",
+                "function": {"name": t.name, "description": desc, "parameters": schema},
+            })
+            video_tool_names.add(t.name)
+            video_tool_schemas[t.name] = schema
+        video_session = session
+        logger.info(f"Video-Audio MCP connected successfully: discovered {len(video_tool_names)} tools")
+    except Exception as e:
+        logger.exception(f"فشل الاتصال بخادم video-audio-mcp: {e}")
+        video_session = None
+        video_tool_names.clear()
+
+async def _disconnect_video_mcp() -> None:
+    global _video_exit_stack
+    if _video_exit_stack:
+        try:
+            await _video_exit_stack.aclose()
+        except Exception as e:
+            logger.warning(f"خطأ أثناء إغلاق اتصال video-audio-mcp: {e}")
+        _video_exit_stack = None
+
+def _resolve_video_args(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    schema = video_tool_schemas.get(name) or {}
+    props = list((schema.get("properties") or {}).keys())
+    if not props:
+        return arguments
+    resolved = dict(arguments)
+    used_targets = {k for k in resolved if k in props}
+    for key in list(resolved.keys()):
+        if key in props:
+            continue
+        key_tokens = set(t for t in key.lower().replace("-", "_").split("_") if t)
+        best, best_score = None, 0
+        for p in props:
+            if p in used_targets:
+                continue
+            p_tokens = set(t for t in p.lower().replace("-", "_").split("_") if t)
+            score = len(key_tokens & p_tokens) * 10
+            score += sum(
+                1 for kt in key_tokens for pt in p_tokens
+                if len(kt) >= 2 and (kt in pt or pt in kt)
+            )
+            if score > best_score:
+                best, best_score = p, score
+        if best and best_score > 0:
+            resolved[best] = resolved.pop(key)
+            used_targets.add(best)
+    return resolved
+
+async def _call_video_tool(name: str, arguments: Dict[str, Any]) -> str:
+    if not video_session:
+        raise RuntimeError("خادم أدوات الفيديو غير متصل حالياً")
+    arguments = _resolve_video_args(name, arguments)
+    result = await video_session.call_tool(name, arguments)
+    parts = [getattr(c, "text", None) or str(c) for c in (result.content or [])]
+    return "\n".join(p for p in parts if p)
+
+# ══════════════════════════════════════════════════════════
+# دعم اللغة العربية في ملفات PDF
+# ══════════════════════════════════════════════════════════
+FONTS_DIR = BASE_DIR / "fonts"
+FONTS_DIR.mkdir(exist_ok=True)
+ARABIC_FONT_PATH = FONTS_DIR / "Amiri-Regular.ttf"
+ARABIC_FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/amiri/Amiri-Regular.ttf"
+ARABIC_FONT_NAME = "Amiri"
+_arabic_font_ready = False
+
+async def _ensure_arabic_font() -> None:
+    global _arabic_font_ready
+    try:
+        if not ARABIC_FONT_PATH.exists():
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(ARABIC_FONT_URL)
+                r.raise_for_status()
+                ARABIC_FONT_PATH.write_bytes(r.content)
+        
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        pdfmetrics.registerFont(TTFont(ARABIC_FONT_NAME, str(ARABIC_FONT_PATH)))
+        _arabic_font_ready = True
+        logger.info("Arabic PDF font (Amiri) registered successfully")
+        
+    except Exception as e:
+        logger.warning(f"تعذّر تجهيز الخط العربي لملفات PDF: {e}")
+        _arabic_font_ready = False
+
+def _shape_text(text: str) -> str:
+    try:
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+        return get_display(arabic_reshaper.reshape(text))
+    except Exception:
+        return text
+
+# ══════════════════════════════════════════════════════════
+# lifespan
+# ══════════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await services.init_db()
-    await services.start_cleanup()
-    log(f"gemini-web2api v{__version__} started", "INFO")
+    _load_super_agent_state()
+    await _connect_video_mcp()
+    await auth.reload()
+    result = await registry.startup_from_config()
+    logger.info(f"Hub startup result: {result}")
+    logger.info(f"Registered routes: {list(registry.tool_routes.keys())}")
+    logger.info(f"🔌 حالة الوكيل الخارق عند الإقلاع: enabled={_super_agent_enabled}")
+    await _ensure_arabic_font()
     yield
-    if services._cleanup_task:
-        services._cleanup_task.cancel()
+    await _disconnect_video_mcp()
+    await registry.shutdown()
 
-app = FastAPI(
-    title="Gemini Web2API (Agent Edition)",
-    version=__version__,
-    description="OpenAI-compatible proxy for Google Gemini Web with full Agent/Tool support",
-    lifespan=lifespan,
-)
+app = FastAPI(title="9Router Tools Server", version="1.0.2", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ─── /v1/models ───────────────────────────────────────────────────────────────
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
-@app.get("/v1/models")
-async def list_models():
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": name,
-                "object": "model",
-                "created": 1700000000,
-                "owned_by": "google",
-                "description": cfg["desc"],
-                "capabilities": {
-                    "tool_use": True,
-                    "streaming": True,
-                    "agent_loop": True,
-                },
-            }
-            for name, cfg in MODELS.items()
-        ],
-    }
+app.mount("/files", StaticFiles(directory=str(FILES_DIR)), name="files")
 
-# ─── /v1beta/models ───────────────────────────────────────────────────────────
+def save_bytes(data: bytes, ext: str) -> str:
+    filename = f"{uuid.uuid4().hex}.{ext}"
+    (FILES_DIR / filename).write_bytes(data)
+    return f"/files/{filename}"
 
-@app.get("/v1beta/models")
-async def google_models_list():
-    return {
-        "models": [
-            {
-                "name": f"models/{name}",
-                "displayName": name,
-                "description": cfg["desc"],
-                "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
-            }
-            for name, cfg in MODELS.items()
-        ]
-    }
+# ══════════════════════════════════════════════════════════
+# ★ ★ ★ دالة move_to_files ★ ★ ★
+# ══════════════════════════════════════════════════════════
+def move_to_files(source_path: str, filename: str = None) -> str:
+    FILES_DIR = Path("/app/files")
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
+    if filename is None:
+        filename = Path(source_path).name
+    dest_path = FILES_DIR / filename
+    shutil.copy2(source_path, dest_path)
+    return f"/files/{filename}"
 
-# ─── /v1/chat/completions ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+# حماية SSRF
+# ══════════════════════════════════════════════════════════
+_BLOCKED_HOSTNAMES = {"localhost", "metadata.google.internal"}
 
-@app.post("/v1/chat/completions")
-async def chat_completions(
-    body: ChatCompletionRequest,
-    request: Request,
-    _: str = Depends(verify_api_key),
-):
-    # Rate Limiting
-    client_ip = request.client.host
-    allowed, wait_time = await services.check_rate_limit(client_ip)
-    if not allowed:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded. Retry in {wait_time}s.",
-            headers={"Retry-After": str(wait_time)},
+def _is_url_safe(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    if host.lower() in _BLOCKED_HOSTNAMES:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        ip_str = info[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            return False
+    return True
+
+async def _download(url: Optional[str], base64_data: Optional[str]) -> bytes:
+    if base64_data:
+        return base64.b64decode(base64_data)
+    if url:
+        if not _is_url_safe(url):
+            raise ValueError("الرابط غير آمن أو محظور (حماية SSRF)")
+        async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
+            r = await client.get(url)
+            if r.is_redirect:
+                raise ValueError("إعادة التوجيه (redirect) غير مسموح بها لأسباب أمنية (SSRF)")
+            r.raise_for_status()
+            return r.content
+    raise ValueError("يجب توفير url أو base64_data")
+
+# ══════════════════════════════════════════════════════════
+# 1) FIRECRAWL
+# ══════════════════════════════════════════════════════════
+async def firecrawl_search(query: str, limit: int = 5) -> dict:
+    if not FIRECRAWL_API_KEY:
+        return {"error": "FIRECRAWL_API_KEY غير مضبوط على الخادم"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://api.firecrawl.dev/v1/search",
+            headers={"Authorization": f"Bearer {FIRECRAWL_API_KEY}"},
+            json={"query": query, "limit": limit},
         )
-
-    model_name, model_id, think_mode, err = resolve_model(
-        body.model or CONFIG["default_model"]
-    )
-    if err:
-        raise HTTPException(status_code=400, detail=err)
-
-    tools = body.tools
-    messages = [m.dict(exclude_none=True) for m in body.messages]
-    cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    created = int(time.time())
-
-    # Cache key
-    context_str = "".join(f"{m.get('role')}:{m.get('content')}" for m in messages)
-    cache_key = hashlib.md5(
-        f"{model_name}:{context_str}:{body.user}:{bool(tools)}".encode()
-    ).hexdigest()
-
-    # ─── Streaming ───
-    if body.stream:
-        async def stream_gen():
-            full_text = ""
-            try:
-                if tools:
-                    # ✅ Streaming مع أدوات: نُرسل tool calls كـ chunk خاص
-                    loop = asyncio.get_event_loop()
-                    text, tool_calls, _ = await loop.run_in_executor(
-                        None, run_agent_sync,
-                        messages, model_id, think_mode, tools,
-                        CONFIG["agent_max_iterations"]
-                    )
-                    full_text = text or ""
-
-                    if tool_calls:
-                        # إرسال tool calls chunk
-                        msg_delta = {"role": "assistant", "content": full_text or None, "tool_calls": tool_calls}
-                        chunk = {
-                            "id": cid, "object": "chat.completion.chunk",
-                            "created": created, "model": model_name,
-                            "choices": [{"index": 0, "delta": msg_delta, "finish_reason": "tool_calls"}],
-                        }
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    else:
-                        # إرسال النص تدريجياً
-                        if full_text:
-                            chunk = {
-                                "id": cid, "object": "chat.completion.chunk",
-                                "created": created, "model": model_name,
-                                "choices": [{"index": 0, "delta": {"role": "assistant", "content": full_text}, "finish_reason": None}],
-                            }
-                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-                else:
-                    # Streaming بدون أدوات
-                    prompt = messages_to_prompt(messages)
-                    for delta in gemini_stream_iter(prompt, model_id, think_mode):
-                        full_text += delta
-                        chunk = {
-                            "id": cid, "object": "chat.completion.chunk",
-                            "created": created, "model": model_name,
-                            "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                        }
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-                # Final chunk
-                finish = "tool_calls" if tools and full_text else "stop"
-                final_chunk = {
-                    "id": cid, "object": "chat.completion.chunk",
-                    "created": created, "model": model_name,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
-                }
-                yield f"data: {json.dumps(final_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-
-                # Cache النص النهائي (بدون tool calls)
-                if full_text and not tools:
-                    resp_data = _build_completion_response(cid, created, model_name, full_text, None, "")
-                    await services.set_cache(cache_key, json.dumps(resp_data))
-
-            except Exception as e:
-                log(f"Stream error: {e}", "ERROR")
-                yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'server_error'}})}\n\n"
-
-        return StreamingResponse(stream_gen(), media_type="text/event-stream")
-
-    # ─── Non-streaming ───
-    # Cache (فقط بدون أدوات)
-    if not tools:
-        cached = await services.get_cache(cache_key)
-        if cached:
-            return JSONResponse(content=json.loads(cached))
-
-    try:
-        loop = asyncio.get_event_loop()
-        if tools:
-            # ✅ استخدم Agent Loop
-            text, tool_calls, _ = await loop.run_in_executor(
-                None, run_agent_sync,
-                messages, model_id, think_mode, tools,
-                CONFIG["agent_max_iterations"]
-            )
-        else:
-            prompt = messages_to_prompt(messages)
-            text, tool_calls = await loop.run_in_executor(
-                None, call_gemini_sync, prompt, model_id, think_mode, None
-            )
-    except Exception as e:
-        log(f"Error: {e}", "ERROR")
-        raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
-
-    prompt_text = messages_to_prompt(messages)
-    resp_data = _build_completion_response(cid, created, model_name, text, tool_calls, prompt_text)
-
-    if not tools:
-        await services.set_cache(cache_key, json.dumps(resp_data))
-
-    return JSONResponse(content=resp_data)
-
-
-def _build_completion_response(
-    cid: str, created: int, model: str, text: str,
-    tool_calls: Optional[list], prompt: str = ""
-) -> dict:
-    msg = {"role": "assistant", "content": text or None}
-    if tool_calls:
-        msg["tool_calls"] = tool_calls
-    finish = "tool_calls" if tool_calls else "stop"
-    return {
-        "id": cid,
-        "object": "chat.completion",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-        "usage": {
-            "prompt_tokens": len(prompt) // 4,
-            "completion_tokens": len(text) // 4 if text else 0,
-            "total_tokens": (len(prompt) + len(text)) // 4 if text else len(prompt) // 4,
-        },
-    }
-
-# ─── /v1/responses (Codex CLI / Responses API) ────────────────────────────────
-
-@app.post("/v1/responses")
-async def responses_api(
-    request: Request,
-    _: str = Depends(verify_api_key),
-):
-    req = await request.json()
-    model_name, model_id, think_mode, err = resolve_model(
-        req.get("model", CONFIG["default_model"])
-    )
-    if err:
-        raise HTTPException(status_code=400, detail=err)
-
-    input_items = req.get("input", [])
-    tools = req.get("tools")
-    messages = []
-
-    if req.get("instructions"):
-        messages.append({"role": "system", "content": req["instructions"]})
-
-    if isinstance(input_items, str):
-        messages.append({"role": "user", "content": input_items})
-    elif isinstance(input_items, list):
-        for item in input_items:
-            if isinstance(item, str):
-                messages.append({"role": "user", "content": item})
-            elif isinstance(item, dict):
-                if item.get("type") == "function_call_output":
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": item.get("call_id", ""),
-                        "name": item.get("name", ""),
-                        "content": item.get("output", ""),
-                    })
-                elif item.get("role") == "assistant":
-                    cp = item.get("content", [])
-                    text_acc, tc_list = "", []
-                    if isinstance(cp, list):
-                        for c in cp:
-                            if isinstance(c, dict):
-                                if c.get("type") == "output_text":
-                                    text_acc += c.get("text", "")
-                                elif c.get("type") == "function_call":
-                                    tc_list.append(c)
-                    elif isinstance(cp, str):
-                        text_acc = cp
-                    m = {"role": "assistant", "content": text_acc or None}
-                    if tc_list:
-                        m["tool_calls"] = [
-                            {
-                                "id": tc.get("call_id", f"call_{i}"),
-                                "type": "function",
-                                "function": {
-                                    "name": tc.get("name", ""),
-                                    "arguments": tc.get("arguments", "{}"),
-                                }
-                            }
-                            for i, tc in enumerate(tc_list)
-                        ]
-                    messages.append(m)
-                else:
-                    role = item.get("role", "user")
-                    content = item.get("content", "")
-                    if isinstance(content, list):
-                        content = " ".join(
-                            c.get("text", "") for c in content
-                            if c.get("type") in ("text", "input_text")
-                        )
-                    messages.append({"role": role, "content": content})
-
-    if tools:
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "parameters": t.get("parameters", {}),
-                }
-            }
-            if t.get("type") == "function" and "function" not in t else t
-            for t in tools
-        ]
-
-    if not any(m.get("content") for m in messages):
-        raise HTTPException(status_code=400, detail="Empty input")
-
-    loop = asyncio.get_event_loop()
-    try:
-        if tools:
-            text, tool_calls, _ = await loop.run_in_executor(
-                None, run_agent_sync, messages, model_id, think_mode, tools,
-                CONFIG["agent_max_iterations"]
-            )
-        else:
-            prompt = messages_to_prompt(messages)
-            text, tool_calls = await loop.run_in_executor(
-                None, call_gemini_sync, prompt, model_id, think_mode, None
-            )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
-
-    rid = f"resp_{uuid.uuid4().hex[:16]}"
-    mid = f"msg_{uuid.uuid4().hex[:12]}"
-    output = []
-
-    if tool_calls:
-        for tc in tool_calls:
-            output.append({
-                "type": "function_call",
-                "id": tc["id"],
-                "call_id": tc["id"],
-                "name": tc["function"]["name"],
-                "arguments": tc["function"]["arguments"],
-                "status": "completed",
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("data") or data.get("results") or []
+        out = []
+        for item in results[:limit]:
+            out.append({
+                "title": item.get("title"),
+                "url": item.get("url"),
+                "snippet": item.get("description") or (item.get("markdown") or "")[:300],
             })
-    if text or not tool_calls:
-        output.append({
-            "type": "message",
-            "id": mid,
-            "role": "assistant",
-            "status": "completed",
-            "content": [{"type": "output_text", "text": text or "", "annotations": []}],
-        })
+        return {"results": out}
 
-    prompt_text = messages_to_prompt(messages)
-    if req.get("stream"):
-        async def responses_stream():
-            yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': {'id': rid, 'object': 'response', 'status': 'in_progress', 'model': model_name, 'output': []}})}\n\n"
-            for item in output:
-                if item["type"] == "function_call":
-                    ev = {
-                        "type": "response.function_call_arguments.done",
-                        "item_id": item["id"], "call_id": item["call_id"],
-                        "name": item["name"], "arguments": item["arguments"],
-                    }
-                    yield f"event: response.function_call_arguments.done\ndata: {json.dumps(ev)}\n\n"
-                elif item["type"] == "message":
-                    for ci, cp in enumerate(item["content"]):
-                        ev = {
-                            "type": "response.output_text.done",
-                            "item_id": item["id"], "content_index": ci, "text": cp["text"],
-                        }
-                        yield f"event: response.output_text.done\ndata: {json.dumps(ev)}\n\n"
-            resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": output}
-            yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': resp_obj})}\n\n"
-        return StreamingResponse(responses_stream(), media_type="text/event-stream")
-
-    return JSONResponse({
-        "id": rid, "object": "response", "created_at": int(time.time()),
-        "status": "completed", "model": model_name, "output": output,
-        "usage": {
-            "input_tokens": len(prompt_text) // 4,
-            "output_tokens": len(text) // 4 if text else 0,
-            "total_tokens": (len(prompt_text) + len(text)) // 4 if text else len(prompt_text) // 4,
-        },
-    })
-
-# ─── Google Native API /v1beta ────────────────────────────────────────────────
-
-def _google_contents_to_prompt(req: dict) -> str:
-    parts = []
-    sys_inst = req.get("systemInstruction")
-    if sys_inst:
-        sys_text = " ".join(p.get("text", "") for p in sys_inst.get("parts", []) if p.get("text"))
-        if sys_text:
-            parts.append(f"[SYSTEM]\n{sys_text}")
-    for content in req.get("contents", []):
-        role = content.get("role", "user")
-        text = " ".join(p.get("text", "") for p in content.get("parts", []) if p.get("text"))
-        if role == "model":
-            parts.append(f"[ASSISTANT]: {text}")
-        else:
-            parts.append(f"[USER]: {text}")
-    return "\n\n".join(p for p in parts if p)
-
-@app.post("/v1beta/models/{model_path:path}")
-async def google_generate(model_path: str, request: Request):
-    req = await request.json()
-    model_name_raw = model_path.split(":")[0]
-    stream = ":streamGenerateContent" in model_path
-
-    model_name, model_id, think_mode, err = resolve_model(model_name_raw)
-    if err:
-        raise HTTPException(status_code=400, detail=err)
-
-    prompt = _google_contents_to_prompt(req)
-    if not prompt.strip():
-        raise HTTPException(status_code=400, detail="Empty content")
-
-    loop = asyncio.get_event_loop()
-    try:
-        text, _ = await loop.run_in_executor(
-            None, call_gemini_sync, prompt, model_id, think_mode, None
+async def firecrawl_scrape(url: str) -> dict:
+    if not FIRECRAWL_API_KEY:
+        return {"error": "FIRECRAWL_API_KEY غير مضبوط على الخادم"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            "https://api.firecrawl.dev/v1/scrape",
+            headers={"Authorization": f"Bearer {FIRECRAWL_API_KEY}"},
+            json={"url": url, "formats": ["markdown"]},
         )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
+        r.raise_for_status()
+        data = r.json()
+        markdown = (data.get("data") or {}).get("markdown", "")
+        return {"markdown": markdown[:8000]}
 
-    candidate = {
-        "content": {"parts": [{"text": text or ""}], "role": "model"},
-        "finishReason": "STOP",
-        "index": 0,
+# ══════════════════════════════════════════════════════════
+# 2) CONTEXT7
+# ══════════════════════════════════════════════════════════
+async def context7_resolve_library(query: str) -> dict:
+    if not CONTEXT7_API_KEY:
+        return {"error": "CONTEXT7_API_KEY غير مضبوط على الخادم"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            "https://context7.com/api/v1/search",
+            params={"query": query},
+            headers={"Authorization": f"Bearer {CONTEXT7_API_KEY}"},
+        )
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results", data if isinstance(data, list) else [])
+        libs = [{"id": it.get("id"), "title": it.get("title") or it.get("name")} for it in results[:8]]
+        return {"libraries": libs}
+
+async def context7_get_docs(library_id: str, topic: Optional[str] = None) -> dict:
+    if not CONTEXT7_API_KEY:
+        return {"error": "CONTEXT7_API_KEY غير مضبوط على الخادم"}
+    params = {"topic": topic} if topic else {}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"https://context7.com/api/v1/{library_id}",
+            params=params,
+            headers={"Authorization": f"Bearer {CONTEXT7_API_KEY}"},
+        )
+        r.raise_for_status()
+        data = r.json()
+        content = data.get("content") or data.get("text") or json.dumps(data, ensure_ascii=False)
+        return {"docs": content[:6000]}
+
+# ══════════════════════════════════════════════════════════
+# 3) COMPOSIO — التعديلات الجراحية النهائية
+# ══════════════════════════════════════════════════════════
+async def composio_list_connected_tools() -> dict:
+    if not COMPOSIO_API_KEY:
+        return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        r = await client.get(
+            f"{COMPOSIO_BASE_URL}/connected_accounts",
+            headers={"x-api-key": COMPOSIO_API_KEY},
+        )
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("items", [])
+        
+        # ✅ تسجيل العينة الخام للتشخيص
+        if items:
+            logger.info(f"📋 Raw connected_account sample: {items[0]}")
+        
+        tools = [{
+            "slug": (it.get("toolkit") or {}).get("slug"),
+            "id": it.get("id"),
+            "alias": it.get("alias"),
+            "status": it.get("status"),
+            # ✅ إضافة user_id من الحقل الصحيح
+            "user_id": it.get("user_id") or it.get("entity_id") or it.get("entityId"),
+        } for it in items]
+        
+        return {
+            "connected_tools": tools,
+            "hint": (
+                "استخدم حقل 'user_id' هنا بالضبط عند استدعاء composio_execute_tool — "
+                "لا تخترع قيمة عشوائية مثل 'user_123'. اختر حساباً بحالة status='ACTIVE' فقط."
+            ),
+        }
+
+async def composio_list_tools(toolkit_slug: str, limit: int = 20) -> dict:
+    if not COMPOSIO_API_KEY:
+        return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
+    if not toolkit_slug or not toolkit_slug.strip():
+        return {
+            "error": "المعامل 'toolkit_slug' مطلوب ولا يمكن أن يكون فارغاً.",
+            "suggestion": "استخدم composio_list_connected_tools أولاً للحصول على قائمة toolkits المتصلة.",
+            "example": "مثال: toolkit_slug='gmail' أو toolkit_slug='github'"
+        }
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        r = await client.get(
+            f"{COMPOSIO_BASE_URL_V31}/tools",
+            params={
+                "toolkit_slug": toolkit_slug,
+                "toolkit_versions": "latest",
+                "limit": limit,
+            },
+            headers={"x-api-key": COMPOSIO_API_KEY},
+        )
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("items", data if isinstance(data, list) else [])
+        tools = [{
+            "slug": it.get("slug") or it.get("name"),
+            "description": (it.get("description") or "")[:200],
+        } for it in items[:limit]]
+        
+        logger.info(f"📋 Tools found for '{toolkit_slug}': {[t['slug'] for t in tools]}")
+        
+        return {"toolkit": toolkit_slug, "tools": tools}
+
+async def composio_execute_tool(
+    slug: str,
+    arguments: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
+    version: str = "latest",
+) -> dict:
+    if not COMPOSIO_API_KEY:
+        return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
+    if not slug or not slug.strip():
+        return {
+            "error": "المعامل 'slug' مطلوب ولا يمكن أن يكون فارغاً.",
+            "suggestion": "استخدم composio_list_tools أولاً لمعرفة الـ slug الصحيح."
+        }
+    
+    effective_user_id = user_id or COMPOSIO_DEFAULT_USER_ID
+    payload: Dict[str, Any] = {
+        "arguments": arguments or {},
+        "version": version,
+        "user_id": effective_user_id,
     }
-    response_obj = {
-        "candidates": [candidate],
-        "usageMetadata": {
-            "promptTokenCount": len(prompt) // 4,
-            "candidatesTokenCount": len(text) // 4 if text else 0,
-            "totalTokenCount": (len(prompt) + len(text)) // 4 if text else len(prompt) // 4,
-        },
-        "modelVersion": model_name,
+    
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        r = await client.post(
+            f"{COMPOSIO_BASE_URL_V31}/tools/execute/{slug}",
+            headers={"x-api-key": COMPOSIO_API_KEY, "Content-Type": "application/json"},
+            json=payload,
+        )
+        if r.status_code == 404:
+            error_text = r.text.lower()
+            toolkit_guess = slug.split("_")[0].lower()
+            
+            # ✅ حالة 1: لا يوجد حساب متصل بهذا الـ user_id
+            if "no connected account" in error_text or "not found for user" in error_text:
+                connected = await composio_list_connected_tools()
+                active_accounts = [
+                    t for t in connected.get("connected_tools", [])
+                    if t.get("slug") == toolkit_guess and t.get("status") == "ACTIVE"
+                ]
+                return {
+                    "error": f"لا يوجد حساب '{toolkit_guess}' نشط مرتبط بـ user_id='{effective_user_id}'.",
+                    "status_code": 404,
+                    "composio_detail": r.text[:500],
+                    "used_user_id": effective_user_id,
+                    "active_accounts_found": active_accounts,
+                    "instruction": (
+                        "إن كانت active_accounts_found غير فارغة، أعد الاستدعاء بنفس user_id "
+                        "الموجود في أحد عناصرها بالضبط. إن كانت فارغة، لا يوجد حساب نشط إطلاقاً "
+                        "ويجب إعادة الربط عبر composio_authorize_toolkit أولاً."
+                    ),
+                }
+            
+            # ✅ حالة 2: اسم slug غير صحيح (احتياطي)
+            suggestion = await composio_list_tools(toolkit_slug=toolkit_guess, limit=50)
+            return {
+                "error": f"الأداة '{slug}' غير موجودة (404).",
+                "status_code": 404,
+                "composio_detail": r.text[:500],
+                "correct_slugs_for_this_toolkit": suggestion.get("tools", []),
+                "instruction": "استخدم أحد الأسماء في 'correct_slugs_for_this_toolkit' حرفياً، لا تخمّن الاسم."
+            }
+        
+        r.raise_for_status()
+        return r.json()
+
+async def composio_create_session(
+    user_id: str,
+    toolkits: Optional[List[str]] = None,
+    wait_for_connections: bool = False,
+    callback_url: Optional[str] = None,
+) -> dict:
+    if not COMPOSIO_API_KEY:
+        return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
+    if not user_id or not user_id.strip():
+        return {
+            "error": "المعامل 'user_id' مطلوب ولا يمكن أن يكون فارغاً.",
+            "suggestion": "قدم معرف مستخدم صالح (مثل 'user_123' أو معرف البريد الإلكتروني)."
+        }
+
+    payload: Dict[str, Any] = {"user_id": user_id}
+
+    if toolkits is not None:
+        toolkits_lower = [str(tk).lower().strip() for tk in toolkits if tk is not None]
+        all_keywords = {"all", "select all", "select_all", "كل", "الكل", "جميع", "all toolkits"}
+        is_all_selected = any(k in toolkits_lower for k in all_keywords) or toolkits == []
+
+        if not is_all_selected:
+            cleaned_tools = [tk for tk in toolkits_lower if tk and tk not in all_keywords]
+            if cleaned_tools:
+                payload["toolkits"] = {"enable": cleaned_tools}
+
+    payload["manage_connections"] = {
+        "enable": True,
+        "enable_wait_for_connections": wait_for_connections,
+        "enable_connection_removal": True,
     }
 
-    if stream:
-        async def google_stream():
-            yield f"data: {json.dumps(response_obj)}\n\n"
-        return StreamingResponse(google_stream(), media_type="text/event-stream")
+    if callback_url:
+        payload["manage_connections"]["callback_url"] = callback_url
 
-    return JSONResponse(response_obj)
+    async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
+        r = await client.post(
+            f"{COMPOSIO_BASE_URL_V31}/tool_router/session",
+            headers={"x-api-key": COMPOSIO_API_KEY, "Content-Type": "application/json"},
+            json=payload,
+        )
+        if r.status_code == 400:
+            return {
+                "error": "خطأ في التحقق من صحة الطلب",
+                "detail": r.text[:500],
+                "payload_sent": payload,
+                "suggestion": "تأكد من أن جميع الحقول متوافقة مع إصدار API المستخدم"
+            }
+        r.raise_for_status()
+        data = r.json()
+        
+        tool_router_tools = data.get("tool_router_tools", [])
+        session_id = data.get("session_id")
+        logger.info(f"📋 Session {session_id} created successfully")
+        logger.info(f"📋 Tool router tools count: {len(tool_router_tools)}")
+        
+        if tool_router_tools:
+            sample = tool_router_tools[:10]
+            logger.info(f"📋 Sample tools (first 10): {sample}")
+            
+            execute_tools = [t for t in tool_router_tools if "EXECUTE" in str(t).upper() or "SEARCH" in str(t).upper()]
+            if execute_tools:
+                logger.info(f"✅ Found execute/search meta-tools: {execute_tools}")
+            else:
+                logger.warning("⚠️ No execute/search meta-tools found in session response!")
+        else:
+            logger.warning("⚠️ No tool_router_tools returned in session response!")
+        
+        return {
+            "session_id": session_id,
+            "mcp_url": (data.get("mcp") or {}).get("url"),
+            "tool_router_tools": tool_router_tools,
+            "config": data.get("config", {}),
+            "tools_count": len(tool_router_tools),
+        }
 
-# ─── Health & Root ────────────────────────────────────────────────────────────
+async def composio_get_session(session_id: str) -> dict:
+    if not COMPOSIO_API_KEY:
+        return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
+    if not session_id or not session_id.strip():
+        return {"error": "المعامل 'session_id' مطلوب ولا يمكن أن يكون فارغاً."}
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        r = await client.get(
+            f"{COMPOSIO_BASE_URL_V31}/tool_router/session/{session_id}",
+            headers={"x-api-key": COMPOSIO_API_KEY},
+        )
+        if r.status_code == 404:
+            return {"error": f"الجلسة '{session_id}' غير موجودة.", "status_code": 404}
+        r.raise_for_status()
+        return r.json()
+
+async def composio_session_toolkits(session_id: str) -> dict:
+    if not COMPOSIO_API_KEY:
+        return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
+    if not session_id or not session_id.strip():
+        return {"error": "المعامل 'session_id' مطلوب ولا يمكن أن يكون فارغاً."}
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        r = await client.get(
+            f"{COMPOSIO_BASE_URL_V31}/tool_router/session/{session_id}/toolkits",
+            headers={"x-api-key": COMPOSIO_API_KEY},
+        )
+        if r.status_code == 404:
+            return {"error": f"الجلسة '{session_id}' غير موجودة.", "status_code": 404}
+        r.raise_for_status()
+        return r.json()
+
+async def composio_authorize_toolkit(
+    session_id: str,
+    toolkit: str,
+    callback_url: Optional[str] = None,
+) -> dict:
+    if not COMPOSIO_API_KEY:
+        return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
+    if not session_id or not session_id.strip():
+        return {"error": "المعامل 'session_id' مطلوب ولا يمكن أن يكون فارغاً."}
+    if not toolkit or not toolkit.strip():
+        return {"error": "المعامل 'toolkit' مطلوب ولا يمكن أن يكون فارغاً."}
+    
+    effective_callback = callback_url or (
+        f"{SPACE_BASE_URL}/oauth-callback-close" if SPACE_BASE_URL else None
+    )
+    
+    payload: Dict[str, Any] = {"toolkit": toolkit}
+    if effective_callback:
+        payload["callback_url"] = effective_callback
+    
+    url = f"{COMPOSIO_BASE_URL}/tool_router/session/{session_id}/link"
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        r = await client.post(
+            url,
+            headers={"x-api-key": COMPOSIO_API_KEY, "Content-Type": "application/json"},
+            json=payload,
+        )
+        if r.status_code == 404:
+            return {
+                "error": f"الجلسة '{session_id}' غير موجودة أو التطبيق '{toolkit}' غير صالح (404).",
+                "status_code": 404,
+            }
+        r.raise_for_status()
+        data = r.json()
+        redirect_url = data.get("redirect_url") or data.get("redirectUrl")
+        return {"redirect_url": redirect_url, "toolkit": toolkit, "raw": data}
+
+async def composio_close_session(session_id: str) -> dict:
+    if not COMPOSIO_API_KEY:
+        return {"error": "COMPOSIO_API_KEY غير مضبوط على الخادم"}
+    if not session_id or not session_id.strip():
+        return {"error": "المعامل 'session_id' مطلوب ولا يمكن أن يكون فارغاً."}
+    
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        r = await client.delete(
+            f"{COMPOSIO_BASE_URL_V31}/tool_router/session/{session_id}",
+            headers={"x-api-key": COMPOSIO_API_KEY},
+        )
+        if r.status_code == 404:
+            return {"error": f"الجلسة '{session_id}' غير موجودة أو محذوفة مسبقاً.", "status_code": 404}
+        r.raise_for_status()
+        return r.json()
+
+# ══════════════════════════════════════════════════════════
+# 4) المستندات — DOCX / PPTX / PDF / XLSX / Markdown
+# ══════════════════════════════════════════════════════════
+def _apply_markdown_lines(add_heading, add_paragraph, add_bullet, text: str):
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("### "):
+            add_heading(line[4:], 3)
+        elif line.startswith("## "):
+            add_heading(line[3:], 2)
+        elif line.startswith("# "):
+            add_heading(line[2:], 1)
+        elif line.startswith(("- ", "* ")):
+            add_bullet(line[2:])
+        else:
+            add_paragraph(line)
+
+def create_docx(title: str, content_markdown: str) -> dict:
+    from docx import Document
+    doc = Document()
+    doc.add_heading(title, level=1)
+    _apply_markdown_lines(
+        lambda t, lvl: doc.add_heading(t, level=lvl),
+        lambda t: doc.add_paragraph(t),
+        lambda t: doc.add_paragraph(t, style="List Bullet"),
+        content_markdown,
+    )
+    buf = io.BytesIO()
+    doc.save(buf)
+    return {"file_url": save_bytes(buf.getvalue(), "docx")}
+
+def create_pptx(title: str, slides: List[Dict[str, Any]]) -> dict:
+    from pptx import Presentation
+    prs = Presentation()
+    title_slide = prs.slides.add_slide(prs.slide_layouts[0])
+    title_slide.shapes.title.text = title
+    bullet_layout = prs.slide_layouts[1]
+    for s in slides:
+        slide = prs.slides.add_slide(bullet_layout)
+        slide.shapes.title.text = s.get("title", "")
+        tf = slide.placeholders[1].text_frame
+        bullets = s.get("bullets", [])
+        for i, b in enumerate(bullets):
+            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+            p.text = b
+    buf = io.BytesIO()
+    prs.save(buf)
+    return {"file_url": save_bytes(buf.getvalue(), "pptx")}
+
+def create_pdf(title: str, content_markdown: str) -> dict:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_RIGHT
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4)
+    base_styles = getSampleStyleSheet()
+    font = ARABIC_FONT_NAME if _arabic_font_ready else "Helvetica"
+    styles = {
+        "Title": ParagraphStyle("TitleAr", parent=base_styles["Title"], fontName=font, alignment=TA_RIGHT, fontSize=20),
+        "Heading1": ParagraphStyle("H1Ar", parent=base_styles["Heading1"], fontName=font, alignment=TA_RIGHT),
+        "Heading2": ParagraphStyle("H2Ar", parent=base_styles["Heading2"], fontName=font, alignment=TA_RIGHT),
+        "Normal": ParagraphStyle("NormalAr", parent=base_styles["Normal"], fontName=font, alignment=TA_RIGHT, fontSize=12, leading=18),
+    }
+    story = [Paragraph(_shape_text(title), styles["Title"]), Spacer(1, 14)]
+    _apply_markdown_lines(
+        lambda t, lvl: story.append(Paragraph(_shape_text(t), styles["Heading1"] if lvl == 1 else styles["Heading2"])),
+        lambda t: story.append(Paragraph(_shape_text(t), styles["Normal"])),
+        lambda t: story.append(Paragraph(_shape_text("• " + t), styles["Normal"])),
+        content_markdown,
+    )
+    doc.build(story)
+    return {"file_url": save_bytes(buf.getvalue(), "pdf")}
+
+async def read_pdf(url: Optional[str] = None, base64_data: Optional[str] = None, max_pages: int = 20) -> dict:
+    data = await _download(url, base64_data)
+    text_parts: List[str] = []
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            for page in pdf.pages[:max_pages]:
+                text_parts.append(page.extract_text() or "")
+    except Exception:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        for page in reader.pages[:max_pages]:
+            text_parts.append(page.extract_text() or "")
+    full_text = "\n".join(text_parts)
+    return {"text": full_text[:12000], "pages_read": len(text_parts)}
+
+async def pdf_info(url: Optional[str] = None, base64_data: Optional[str] = None) -> dict:
+    data = await _download(url, base64_data)
+    import fitz
+    doc = fitz.open(stream=data, filetype="pdf")
+    return {"pages": doc.page_count, "metadata": doc.metadata}
+
+def create_xlsx(title: str, headers: Optional[List[str]] = None, rows: Optional[List[List[Any]]] = None) -> dict:
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = (title or "Sheet1")[:31]
+    if headers:
+        ws.append(headers)
+    for row in (rows or []):
+        ws.append(row)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return {"file_url": save_bytes(buf.getvalue(), "xlsx")}
+
+async def read_xlsx(url: Optional[str] = None, base64_data: Optional[str] = None, sheet: Optional[str] = None) -> dict:
+    data = await _download(url, base64_data)
+    import pandas as pd
+    df = pd.read_excel(io.BytesIO(data), sheet_name=sheet or 0)
+    return {
+        "columns": [str(c) for c in df.columns],
+        "rows": df.head(200).values.tolist(),
+        "total_rows": int(len(df)),
+    }
+
+def markdown_to_html(markdown_text: str) -> dict:
+    import markdown as md
+    html = md.markdown(markdown_text, extensions=["tables", "fenced_code"])
+    return {"html": html}
+
+async def fetch_media_to_file(url: Optional[str] = None, base64_data: Optional[str] = None, ext: str = "mp4") -> dict:
+    data = await _download(url, base64_data)
+    filename = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
+    path = FILES_DIR / filename
+    path.write_bytes(data)
+    return {"local_path": str(path), "file_url": f"/files/{filename}"}
+
+def write_text_file(content: str, ext: str = "srt") -> dict:
+    filename = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
+    path = FILES_DIR / filename
+    path.write_text(content, encoding="utf-8")
+    return {"local_path": str(path), "file_url": f"/files/{filename}"}
+
+# ══════════════════════════════════════════════════════════
+# سجل الخرائط والدوال الداخلية لـ /call
+# ══════════════════════════════════════════════════════════
+TOOL_FUNCTIONS = {
+    "firecrawl_search": firecrawl_search,
+    "firecrawl_scrape": firecrawl_scrape,
+    "context7_resolve_library": context7_resolve_library,
+    "context7_get_docs": context7_get_docs,
+    "composio_list_connected_tools": composio_list_connected_tools,
+    "composio_list_tools": composio_list_tools,
+    "composio_execute_tool": composio_execute_tool,
+    "composio_create_session": composio_create_session,
+    "composio_get_session": composio_get_session,
+    "composio_session_toolkits": composio_session_toolkits,
+    "composio_authorize_toolkit": composio_authorize_toolkit,
+    "composio_close_session": composio_close_session,
+    "create_docx": create_docx,
+    "create_pptx": create_pptx,
+    "create_pdf": create_pdf,
+    "read_pdf": read_pdf,
+    "pdf_info": pdf_info,
+    "create_xlsx": create_xlsx,
+    "read_xlsx": read_xlsx,
+    "markdown_to_html": markdown_to_html,
+    "fetch_media_to_file": fetch_media_to_file,
+    "write_text_file": write_text_file,
+}
+
+# ══════════════════════════════════════════════════════════
+# قائمة الأدوات المتاحة للنظام الخارجي (OpenAI Manifest)
+# ══════════════════════════════════════════════════════════
+# تم تعريف TOOLS_MANIFEST مسبقاً كقائمة فارغة، وسيتم ملؤها في _connect_video_mcp
+# لكن نحتاج إلى إضافة الأدوات المضمّنة الأساسية هنا (باستثناء أدوات الفيديو التي ستُضاف لاحقاً)
+
+# نضيف الأدوات المضمّنة الأساسية (باستثناء أدوات الفيديو)
+TOOLS_MANIFEST.extend([
+    {"type": "function", "function": {
+        "name": "firecrawl_search",
+        "description": "بحث في الويب عبر Firecrawl وإرجاع أهم النتائج.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "نص البحث"},
+            "limit": {"type": "integer", "description": "عدد النتائج", "default": 5},
+        }, "required": ["query"]},
+    }},
+    {"type": "function", "function": {
+        "name": "firecrawl_scrape",
+        "description": "تصفح رابط ويب محدد وإرجاع محتواه كـ Markdown نظيف.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string"},
+        }, "required": ["url"]},
+    }},
+    {"type": "function", "function": {
+        "name": "context7_resolve_library",
+        "description": "البحث عن معرّف مكتبة برمجية في Context7.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"},
+        }, "required": ["query"]},
+    }},
+    {"type": "function", "function": {
+        "name": "context7_get_docs",
+        "description": "جلب توثيق مكتبة برمجية من Context7.",
+        "parameters": {"type": "object", "properties": {
+            "library_id": {"type": "string"},
+            "topic": {"type": "string"},
+        }, "required": ["library_id"]},
+    }},
+    {"type": "function", "function": {
+        "name": "composio_list_connected_tools",
+        "description": "✅ عرض قائمة التطبيقات المرتبطة بحساب Composio الحالي مع user_id الحقيقي لكل حساب.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "composio_list_tools",
+        "description": "جلب قائمة الأدوات القابلة للتنفيذ فعلياً داخل تطبيق معيّن. يجب استدعاء هذه الدالة أولاً للحصول على slugs صالحة قبل استخدام composio_execute_tool.",
+        "parameters": {"type": "object", "properties": {
+            "toolkit_slug": {"type": "string", "description": "✅ مطلوب: اسم التطبيق بصيغته الصغيرة (مثل 'gmail'، 'github'، 'slack') — لا يمكن أن يكون فارغاً."},
+            "limit": {"type": "integer", "default": 20},
+        }, "required": ["toolkit_slug"]},
+    }},
+    {"type": "function", "function": {
+        "name": "composio_execute_tool",
+        "description": (
+            "✅ تنفيذ أداة Composio. ⚠️ إلزامي: لا تخترع قيمة user_id عشوائية أبداً. "
+            "استدعِ composio_list_connected_tools أولاً، واستخدم حقل 'user_id' الموجود فيه "
+            "لحساب بحالة status='ACTIVE' فقط ونفس toolkit المطلوب."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "slug": {"type": "string", "description": "✅ مطلوب: المعرف الفريد للأداة — لا يمكن أن يكون فارغاً."},
+            "arguments": {"type": "object", "description": "معاملات الأداة المطلوبة (تعتمد على الأداة المحددة)."},
+            "user_id": {"type": "string", "description": "⚠️ إلزامي: القيمة الحقيقية من composio_list_connected_tools — ليس معرّفاً تخترعه."},
+        }, "required": ["slug", "user_id"]},
+    }},
+    {"type": "function", "function": {
+        "name": "composio_create_session",
+        "description": "✅ إنشاء جلسة Composio Tool Router مع تفعيل جميع الأدوات التنفيذية تلقائياً. بعد الإنشاء، استخدم composio_authorize_toolkit لكل تطبيق يحتاج مصادقة.",
+        "parameters": {"type": "object", "properties": {
+            "user_id": {"type": "string", "description": "✅ مطلوب: معرف المستخدم — لا يمكن أن يكون فارغاً."},
+            "toolkits": {"type": "array", "items": {"type": "string"}, "description": "قائمة التطبيقات المطلوب تفعيلها (مثل ['gmail', 'github']). اتركها فارغة أو أرسل ['all'] لتفعيل كل شيء."},
+            "wait_for_connections": {"type": "boolean", "default": False, "description": "انتظار اكتمال المصادقات قبل إنهاء الجلسة."},
+            "callback_url": {"type": "string", "description": "رابط إعادة التوجيه بعد المصادقة."},
+        }, "required": ["user_id"]},
+    }},
+    {"type": "function", "function": {
+        "name": "composio_get_session",
+        "description": "جلب حالة جلسة Tool Router موجودة مسبقاً.",
+        "parameters": {"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "✅ مطلوب: معرف الجلسة — لا يمكن أن يكون فارغاً."},
+        }, "required": ["session_id"]},
+    }},
+    {"type": "function", "function": {
+        "name": "composio_session_toolkits",
+        "description": "عرض توليكيتات جلسة معيّنة وحالة اتصال كل منها.",
+        "parameters": {"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "✅ مطلوب: معرف الجلسة — لا يمكن أن يكون فارغاً."},
+        }, "required": ["session_id"]},
+    }},
+    {"type": "function", "function": {
+        "name": "composio_authorize_toolkit",
+        "description": "✅ إنشاء رابط تسجيل دخول (Connect Link) لتطبيق واحد (toolkit) داخل جلسة Tool Router موجودة. بعد نجاح المصادقة، سيُغلق النافذة تلقائياً.",
+        "parameters": {"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "✅ مطلوب: معرّف الجلسة الناتج عن composio_create_session — لا يمكن أن يكون فارغاً."},
+            "toolkit": {"type": "string", "description": "✅ مطلوب: اسم التطبيق بصيغته الصغيرة، مثل gmail أو slack أو github — لا يمكن أن يكون فارغاً."},
+            "callback_url": {"type": "string", "description": "رابط اختياري يُعاد توجيه المستخدم إليه بعد إتمام تسجيل الدخول (سيُستخدم رابط الإغلاق التلقائي افتراضياً)."},
+        }, "required": ["session_id", "toolkit"]},
+    }},
+    {"type": "function", "function": {
+        "name": "composio_close_session",
+        "description": "✅ إغلاق/حذف جلسة Tool Router بشكل نهائي. استخدمها بعد انتهاء المحادثة أو المهمة لتحرير الموارد، لأن جلسات Tool Router لا تنتهي صلاحيتها تلقائياً.",
+        "parameters": {"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "✅ مطلوب: معرّف الجلسة المراد إغلاقها — لا يمكن أن يكون فارغاً."},
+        }, "required": ["session_id"]},
+    }},
+    {"type": "function", "function": {
+        "name": "create_docx",
+        "description": "إنشاء ملف Word (.docx).",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string"},
+            "content_markdown": {"type": "string"},
+        }, "required": ["title", "content_markdown"]},
+    }},
+    {"type": "function", "function": {
+        "name": "create_pptx",
+        "description": "إنشاء عرض تقديمي (.pptx).",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string"},
+            "slides": {"type": "array", "items": {"type": "object", "properties": {
+                "title": {"type": "string"},
+                "bullets": {"type": "array", "items": {"type": "string"}},
+            }}},
+        }, "required": ["title", "slides"]},
+    }},
+    {"type": "function", "function": {
+        "name": "create_pdf",
+        "description": "إنشاء ملف PDF.",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string"},
+            "content_markdown": {"type": "string"},
+        }, "required": ["title", "content_markdown"]},
+    }},
+    {"type": "function", "function": {
+        "name": "read_pdf",
+        "description": "استخراج النص من ملف PDF.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string"},
+            "base64_data": {"type": "string"},
+            "max_pages": {"type": "integer", "default": 20},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "pdf_info",
+        "description": "معلومات سريعة عن ملف PDF.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string"},
+            "base64_data": {"type": "string"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "create_xlsx",
+        "description": "إنشاء ملف Excel (.xlsx).",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string"},
+            "headers": {"type": "array", "items": {"type": "string"}},
+            "rows": {"type": "array", "items": {"type": "array"}},
+        }, "required": ["title"]},
+    }},
+    {"type": "function", "function": {
+        "name": "read_xlsx",
+        "description": "قراءة بيانات من ملف Excel.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string"},
+            "base64_data": {"type": "string"},
+            "sheet": {"type": "string"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "markdown_to_html",
+        "description": "تحويل نص Markdown إلى HTML.",
+        "parameters": {"type": "object", "properties": {
+            "markdown_text": {"type": "string"},
+        }, "required": ["markdown_text"]},
+    }},
+    {"type": "function", "function": {
+        "name": "fetch_media_to_file",
+        "description": "ينزّل رابط فيديو/صوت (أو base64) ويحفظه كملف فعلي على الخادم، ويُرجع local_path لاستخدامه كمدخل لأدوات الفيديو/الصوت (video_path, input_audio_path...). استخدمها دائماً قبل أي أداة فيديو تحتاج ملفاً من رابط خارجي.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string"},
+            "base64_data": {"type": "string"},
+            "ext": {"type": "string", "description": "امتداد الملف الناتج، مثل mp4 أو mp3 أو wav", "default": "mp4"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "write_text_file",
+        "description": "يكتب نصاً مباشرة (بدون رابط أو base64) إلى ملف حقيقي على الخادم، ويُرجع local_path. استخدمها لإنشاء ملفات ترجمة SRT قبل add_subtitles، أو أي نص آخر تحتاجه أدوات الفيديو كمسار ملف.",
+        "parameters": {"type": "object", "properties": {
+            "content": {"type": "string", "description": "المحتوى النصي الكامل المطلوب كتابته، مثل نص SRT كاملاً"},
+            "ext": {"type": "string", "description": "امتداد الملف الناتج، مثل srt أو txt", "default": "srt"},
+        }, "required": ["content"]},
+    }},
+])
+
+# ══════════════════════════════════════════════════════════
+# نقاط النهاية العامة (Endpoints)
+# ══════════════════════════════════════════════════════════
+class CallRequest(BaseModel):
+    tool: str
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+
+class SuperAgentToggleRequest(BaseModel):
+    enabled: bool
+
+def _check_auth(x_api_key: str) -> None:
+    if APP_SECRET and x_api_key != APP_SECRET:
+        raise HTTPException(401, "غير مصرح: مفتاح API غير صحيح أو مفقود (X-API-Key)")
 
 @app.get("/")
 async def root():
-    return {
-        "service": "gemini-web2api",
-        "version": __version__,
-        "models": list(MODELS.keys()),
-        "features": {
-            "agent_loop": True,
-            "tool_calling": True,
-            "streaming": True,
-            "cache": True,
-            "rate_limiting": True,
-        },
-        "endpoints": ["/v1/chat/completions", "/v1/models", "/v1/responses", "/v1beta/models"],
-    }
+    return {"status": "ok", "service": "9Router Tools Server", "tools_count": len(TOOLS_MANIFEST)}
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "timestamp": time.time(), "version": __version__}
+    return {
+        "status": "ok",
+        "firecrawl_configured": bool(FIRECRAWL_API_KEY),
+        "context7_configured": bool(CONTEXT7_API_KEY),
+        "composio_configured": bool(COMPOSIO_API_KEY),
+        "auth_enforced": bool(APP_SECRET),
+        "video_mcp_connected": bool(video_session),
+        "video_tools_count": len(video_tool_names),
+        "hub_ready": True,
+        "hub_servers": len(registry.servers) if hasattr(registry, 'servers') else 0,
+        "super_agent_enabled": is_super_agent_enabled(),
+    }
 
-# ─── Gradio UI ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+# ★ ★ ★ نقاط نهاية "الوكيل الخارق" ★ ★ ★
+# ══════════════════════════════════════════════════════════
+@app.get("/super-agent/status")
+async def super_agent_status(x_api_key: str = Header(default="")):
+    _check_auth(x_api_key)
+    builtin_count = len(TOOLS_MANIFEST)
+    hub_count = len(registry.tool_routes) if hasattr(registry, "tool_routes") else 0
+    return {
+        "enabled": is_super_agent_enabled(),
+        "builtin_tools_count": builtin_count,
+        "video_tools_count": len(video_tool_names),
+        "hub_tools_count": hub_count,
+        "total_tools_count": builtin_count + hub_count,
+    }
 
-def build_gradio_interface():
-    async def chat_handler(message: str, history: list, model_choice: str, request: gr.Request):
-        if not message or not message.strip():
-            yield history
-            return
+@app.post("/super-agent/toggle")
+async def super_agent_toggle(req: SuperAgentToggleRequest, x_api_key: str = Header(default="")):
+    """
+    تفعيل enabled=true أو تعطيل enabled=false لكل الأدوات دفعة واحدة (نسخة JSON body — للاستخدام البرمجي).
+    """
+    _check_auth(x_api_key)
+    summary = set_super_agent_enabled(req.enabled)
+    return {"ok": True, **summary}
 
-        model_name, model_id, think_mode, err = resolve_model(model_choice)
-        if err:
-            history.append((message, f"❌ {err}"))
-            yield history
-            return
+# ★ ★ ★ نسختان مبسّطتان بـ GET (بدون body) — سهلتا الاستدعاء من رابط مباشر أو زر ★ ★ ★
+@app.get("/super-agent/enable")
+async def super_agent_enable(x_api_key: str = Header(default="")):
+    _check_auth(x_api_key)
+    summary = set_super_agent_enabled(True)
+    return {"ok": True, **summary}
 
-        history.append((message, ""))
-        yield history
+@app.get("/super-agent/disable")
+async def super_agent_disable(x_api_key: str = Header(default="")):
+    _check_auth(x_api_key)
+    summary = set_super_agent_enabled(False)
+    return {"ok": True, **summary}
 
-        full_response = ""
+# ★ ★ ★ صفحة بها زرّان فعليان: "تفعيل الكل" و "تعطيل الكل" ★ ★ ★
+@app.get("/super-agent", response_class=HTMLResponse)
+async def super_agent_page():
+    return """
+    <!DOCTYPE html>
+    <html lang="ar" dir="rtl"><head><meta charset="utf-8">
+    <title>الوكيل الخارق</title>
+    <style>
+        body{font-family:sans-serif;text-align:center;padding-top:60px;background:#0f0f0f;color:#eee;}
+        button{font-size:18px;padding:14px 28px;margin:10px;border:none;border-radius:8px;cursor:pointer;}
+        #on{background:#1e8e3e;color:#fff;}
+        #off{background:#c62828;color:#fff;}
+        #status{margin-top:20px;font-size:16px;color:#aaa;}
+    </style></head>
+    <body>
+        <h2>⚡ الوكيل الخارق</h2>
+        <p id="status">...جاري التحقق من الحالة</p>
+        <div>
+            <button id="on" onclick="setState(true)">✅ تفعيل الكل</button>
+            <button id="off" onclick="setState(false)">🛑 تعطيل الكل</button>
+        </div>
+        <script>
+        async function refresh(){
+            const r = await fetch('/super-agent/status');
+            const d = await r.json();
+            document.getElementById('status').innerText =
+                (d.enabled ? '🟢 الحالة: مفعّل — ' : '🔴 الحالة: معطّل — ') +
+                'إجمالي الأدوات: ' + (d.total_tools_count ?? '?');
+        }
+        async function setState(enabled){
+            document.getElementById('status').innerText = '...جاري التنفيذ';
+            await fetch(enabled ? '/super-agent/enable' : '/super-agent/disable');
+            await refresh();
+        }
+        refresh();
+        </script>
+    </body></html>
+    """
+
+# ══════════════════════════════════════════════════════════
+# ✅ التعديل الجراحي: إزالة تكرار الأدوات من registry.tool_routes
+# + احترام مفتاح الوكيل الخارق: لا نُرجع أي أداة إن كان معطّلاً
+# ══════════════════════════════════════════════════════════
+@app.get("/tools")
+async def list_tools():
+    if not is_super_agent_enabled():
+        return {
+            "tools": [],
+            "super_agent_enabled": False,
+            "message": "الوكيل الخارق معطّل حالياً — تم إيقاف جميع الأدوات. فعّله عبر /super-agent/toggle.",
+        }
+
+    # نبدأ بقائمة TOOLS_MANIFEST (نسخة main.py)
+    all_tools = list(TOOLS_MANIFEST)
+    seen_names = {t["function"]["name"] for t in all_tools}  # تتبع الأسماء المسجلة
+
+    if hasattr(registry, "tool_routes"):
+        for tool_name, route in registry.tool_routes.items():
+            # إذا كان الاسم موجوداً بالفعل في TOOLS_MANIFEST، نتجاوز نسخة hub.py
+            if tool_name in seen_names:
+                continue
+            try:
+                all_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": getattr(route, "description", ""),
+                        "parameters": getattr(route, "input_schema", {"type": "object", "properties": {}})
+                    }
+                })
+                seen_names.add(tool_name)
+            except Exception as e:
+                logger.warning(f"Skipping tool {tool_name} due to error: {e}")
+
+    return {"tools": all_tools, "super_agent_enabled": True}
+
+# ✅ صفحة الإغلاق التلقائي لـ OAuth
+@app.get("/oauth-callback-close")
+async def oauth_callback_close():
+    html_content = """
+    <!DOCTYPE html>
+    <html><head><meta charset="utf-8"></head>
+    <body style="font-family:sans-serif;text-align:center;padding-top:50px;">
+        <h2>✅ تم الربط بنجاح</h2>
+        <p>يمكنك إغلاق هذه النافذة الآن.</p>
+        <script>
+            setTimeout(function() {
+                window.close();
+            }, 1500);
+        </script>
+    </body></html>
+    """
+    return HTMLResponse(content=html_content)
+
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+
+ALLOWED_UPLOAD_EXTS = {
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v",
+    ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac",
+    ".jpg", ".jpeg", ".png", ".webp", ".gif",
+    ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".txt", ".srt",
+}
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...), x_api_key: str = Header(default="")):
+    _check_auth(x_api_key)
+    orig_ext = Path(file.filename or "").suffix.lower() or ""
+    if orig_ext not in ALLOWED_UPLOAD_EXTS:
+        raise HTTPException(
+            400,
+            f"امتداد الملف '{orig_ext or '(بدون امتداد)'}' غير مسموح به. "
+            f"الامتدادات المسموحة: {', '.join(sorted(ALLOWED_UPLOAD_EXTS))}",
+        )
+    filename = f"{uuid.uuid4().hex}{orig_ext}"
+    dest = FILES_DIR / filename
+    size = 0
+    try:
+        with open(dest, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    out.close()
+                    dest.unlink(missing_ok=True)
+                    raise HTTPException(
+                        413,
+                        f"الملف أكبر من الحد المسموح ({MAX_UPLOAD_BYTES // (1024 * 1024)}MB)",
+                    )
+                out.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(500, f"فشل حفظ الملف المرفوع: {e}")
+    finally:
+        await file.close()
+    return {
+        "ok": True,
+        "filename": filename,
+        "original_filename": file.filename,
+        "local_path": str(dest),
+        "file_url": f"/files/{filename}",
+        "size_bytes": size,
+    }
+
+@app.post("/call")
+async def call_tool(req: CallRequest, x_api_key: str = Header(default="")):
+    _check_auth(x_api_key)
+
+    # ★ ★ ★ فحص مفتاح الوكيل الخارق أولاً — قبل أي منطق آخر ★ ★ ★
+    if not is_super_agent_enabled():
+        raise HTTPException(
+            403,
+            "الوكيل الخارق معطّل حالياً — جميع الأدوات (المضمّنة، الفيديو، وأدوات Hub) متوقفة. "
+            "فعّله عبر POST /super-agent/toggle {\"enabled\": true}."
+        )
+    
+    # 1. أدوات الفيديو المحلية
+    if req.tool in video_tool_names:
+        if not video_session:
+            raise HTTPException(503, "خادم أدوات الفيديو (video-audio-mcp) غير متصل حالياً")
         try:
-            prompt = messages_to_prompt([{"role": "user", "content": message}])
-            for chunk in gemini_stream_iter(prompt, model_id, think_mode):
-                full_response += chunk
-                history[-1] = (message, full_response)
-                yield history
+            result_text = await _call_video_tool(req.tool, req.arguments)
+            return {"ok": True, "result": result_text}
         except Exception as e:
-            full_response = f"❌ Error: {e}"
-            history[-1] = (message, full_response)
-            yield history
-
-    api_endpoint = "https://your-space.hf.space/v1"
-    api_key_display = CONFIG.get("api_keys", ["sk-gemini"])[0]
-
-    with gr.Blocks(title="Gemini Web2API — Agent Edition") as demo:
-        gr.Markdown(f"""
-        # 🤖 Gemini Web2API — Agent Edition v{__version__}
-        > OpenAI-compatible proxy مع دعم كامل لـ Agent Loop وTool Calling
-        | | |
-        |---|---|
-        | **Base URL** | `{api_endpoint}` |
-        | **API Key** | `{api_key_display}` |
-        | **Models** | {', '.join(f'`{m}`' for m in MODELS.keys())} |
-        | **Agent Loop** | ✅ حتى {CONFIG['agent_max_iterations']} iterations |
-        """)
-
-        with gr.Row():
-            with gr.Column(scale=4):
-                chatbot = gr.Chatbot(height=500, label="المحادثة")
-            with gr.Column(scale=1):
-                gr.Markdown("""### ✅ المميزات
-- Agent Loop (ReAct)
-- Tool Calling موثوق
-- JSON Parser متعدد المستويات
-- Streaming حقيقي
-- SQLite Cache
-- Rate Limiting
-- Retry Logic
-- Fallback للنموذج الافتراضي
-                """)
-
-        with gr.Row():
-            msg_box = gr.Textbox(label="رسالتك", placeholder="اكتب هنا...", lines=2, scale=5)
-            send_btn = gr.Button("إرسال ▶", variant="primary", scale=1)
-
-        with gr.Row():
-            clear_btn = gr.Button("🗑️ مسح")
-            model_dd = gr.Dropdown(
-                choices=list(MODELS.keys()),
-                value=CONFIG["default_model"],
-                label="النموذج",
-                scale=2,
-            )
-
-        msg_box.submit(chat_handler, [msg_box, chatbot, model_dd], [chatbot]).then(
-            lambda: "", None, [msg_box]
+            raise HTTPException(500, f"خطأ أثناء تنفيذ أداة الفيديو {req.tool}: {e}")
+    
+    # 2. الأدوات المضمّنة في TOOL_FUNCTIONS
+    fn = TOOL_FUNCTIONS.get(req.tool)
+    if fn:
+        try:
+            if asyncio.iscoroutinefunction(fn):
+                result = await fn(**req.arguments)
+            else:
+                result = fn(**req.arguments)
+            return {"ok": True, "result": result}
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except TypeError as e:
+            raise HTTPException(400, f"معاملات غير صحيحة لأداة {req.tool}: {e}")
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text[:500] if e.response is not None else ""
+            raise HTTPException(502, f"خطأ من الخدمة الخارجية: HTTP {e.response.status_code} - {detail}")
+        except Exception as e:
+            raise HTTPException(500, f"خطأ أثناء تنفيذ {req.tool}: {e}")
+    
+    # 3. أدوات Hub (مع سجلات التشخيص)
+    logger.info(f"Incoming tool = {req.tool}")
+    logger.info(f"Available routes = {list(registry.tool_routes.keys())}")
+    
+    if req.tool not in registry.tool_routes:
+        logger.warning(
+            f"Tool '{req.tool}' not found. Available: {list(registry.tool_routes.keys())}"
         )
-        send_btn.click(chat_handler, [msg_box, chatbot, model_dd], [chatbot]).then(
-            lambda: "", None, [msg_box]
-        )
-        clear_btn.click(lambda: [], None, [chatbot])
+    
+    context = internal_context()
+    try:
+        result = await registry.call_tool(req.tool, req.arguments, context)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        error_msg = str(e)
+        if "ToolNotFound" in error_msg or "not found" in error_msg.lower():
+            raise HTTPException(404, error_msg)
+        elif "PermissionDenied" in error_msg or "not allowed" in error_msg.lower():
+            raise HTTPException(403, error_msg)
+        elif "AuthenticationRequired" in error_msg or "authentication required" in error_msg.lower():
+            raise HTTPException(401, error_msg)
+        elif "ServerNotReady" in error_msg or "not ready" in error_msg.lower():
+            raise HTTPException(503, error_msg)
+        elif "OperationTimeout" in error_msg or "timeout" in error_msg.lower():
+            raise HTTPException(504, error_msg)
+        else:
+            raise HTTPException(500, f"خطأ في أداة Hub: {error_msg}")
 
-    return demo
-
-demo = build_gradio_interface()
-app = gr.mount_gradio_app(app, demo, path="/chat")
-
-# ─── Entry Point ──────────────────────────────────────────────────────────────
-
+# ══════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import uvicorn
-
-    parser = argparse.ArgumentParser(description="Gemini Web2API Agent Edition")
-    parser.add_argument("--port", type=int, default=CONFIG["port"])
-    parser.add_argument("--host", type=str, default=CONFIG["host"])
-    parser.add_argument("--cookie-file", type=str, default=None)
-    parser.add_argument("--proxy", type=str, default=None)
-    parser.add_argument("--max-iterations", type=int, default=CONFIG["agent_max_iterations"])
-    parser.add_argument("--version", action="version", version=f"v{__version__}")
-    args = parser.parse_args()
-
-    if args.cookie_file:
-        CONFIG["cookie_file"] = args.cookie_file
-    if args.proxy:
-        CONFIG["proxy"] = args.proxy
-    CONFIG["agent_max_iterations"] = args.max_iterations
-
-    print(f"\n{'='*60}")
-    print(f"  gemini-web2api v{__version__} — Agent Edition")
-    print(f"{'='*60}")
-    print(f"  API:          http://localhost:{args.port}/v1")
-    print(f"  Chat UI:      http://localhost:{args.port}/chat")
-    print(f"  Models:       {', '.join(MODELS.keys())}")
-    print(f"  Agent Loop:   max {CONFIG['agent_max_iterations']} iterations")
-    print(f"  Cookie:       {'✅' if CONFIG.get('cookie_file') or CONFIG.get('_cookie_inline') else '❌ none (anonymous)'}")
-    print(f"  Proxy:        {CONFIG.get('proxy') or '❌ none'}")
-    print(f"{'='*60}\n")
-
     uvicorn.run(
-        app,
-        host=args.host,
-        port=args.port,
-        loop="asyncio",
-        timeout_keep_alive=120,
+        "main:app",
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "7860")),
+        reload=False,
+        access_log=True,
     )
