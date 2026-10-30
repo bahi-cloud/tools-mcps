@@ -22,6 +22,7 @@ import logging
 import traceback
 import shutil
 import hashlib
+import time
 import contextvars  # ★ NEW: لعزل الملفات
 from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
@@ -376,6 +377,42 @@ _hub_stop: Optional[asyncio.Event] = None
 _hub_task: Optional[asyncio.Task] = None
 _font_task: Optional[asyncio.Task] = None
 _hub_state: Dict[str, Any] = {"ready": False, "result": None}
+_watchdog_task: Optional[asyncio.Task] = None
+
+
+def _read_cgroup_memory() -> Optional[tuple]:
+    """يعيد (المستعمل, الحد) بالبايت من cgroup v2 أو v1 إن توفر."""
+    pairs = [
+        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+        ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ]
+    for cur_p, max_p in pairs:
+        try:
+            cur = int(Path(cur_p).read_text().strip())
+            mx_raw = Path(max_p).read_text().strip()
+            mx = int(mx_raw) if mx_raw.isdigit() else None
+            return cur, mx
+        except Exception:
+            continue
+    return None
+
+
+async def _watchdog() -> None:
+    """★ تشخيص: يسجل أي تجمّد في الـ event loop (>1s) وضغط الذاكرة (>80%)."""
+    tick = 0
+    while True:
+        t0 = time.monotonic()
+        await asyncio.sleep(1)
+        lag = time.monotonic() - t0 - 1
+        if lag > 1.0:
+            logger.warning(f"⚠️ Event loop lag: {lag:.1f}s (التطبيق كان مجمّداً)")
+        tick += 1
+        if tick % 30 == 0:
+            mem = _read_cgroup_memory()
+            if mem and mem[1]:
+                pct = mem[0] / mem[1] * 100
+                level = logger.warning if pct > 80 else logger.info
+                level(f"🧠 Memory: {mem[0] / 1e9:.2f}GB / {mem[1] / 1e9:.2f}GB ({pct:.0f}%)")
 
 
 async def _background_startup() -> None:
@@ -404,7 +441,7 @@ async def _background_startup() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _hub_stop, _hub_task, _font_task
+    global _hub_stop, _hub_task, _font_task, _watchdog_task
     _load_super_agent_state()
     await auth.reload()
     logger.info(f"🔌 حالة الوكيل الخارق عند الإقلاع: enabled={_super_agent_enabled}")
@@ -412,6 +449,7 @@ async def lifespan(app: FastAPI):
     _hub_stop = asyncio.Event()
     _hub_task = asyncio.create_task(_background_startup())
     _font_task = asyncio.create_task(_ensure_arabic_font())
+    _watchdog_task = asyncio.create_task(_watchdog())
 
     yield  # ← التطبيق يستقبل الطلبات هنا مباشرة
 
@@ -421,6 +459,8 @@ async def lifespan(app: FastAPI):
         _hub_task.cancel()
     if _font_task and not _font_task.done():
         _font_task.cancel()
+    if _watchdog_task:
+        _watchdog_task.cancel()
 
 
 app = FastAPI(title="9Router Tools Server", version="1.0.5", lifespan=lifespan)
@@ -435,8 +475,12 @@ app.add_middleware(
 
 @app.middleware("http")
 async def _security_headers(request, call_next):
+    t0 = time.monotonic()
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
+    dur = time.monotonic() - t0
+    if dur > 3.0:
+        logger.warning(f"🐢 Slow request: {request.method} {request.url.path} took {dur:.1f}s")
     return response
 
 
