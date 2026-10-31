@@ -1,9 +1,11 @@
 # main.py - التعديلات الجراحية النهائية
-# + إصلاح user_id + إزالة تكرار الأدوات + الوكيل الخارق
+# + إصلاح user_id + إزالة تكرار الأدوات
 # + عزل المستخدمين في /call + composio_revoke_account + /composio/disconnect
 # + قراءة كسولة لـ COMPOSIO_API_KEY و COMPOSIO_DEFAULT_USER_ID
 # + revoke_account على v3.1 مع revoke_on_delete=true (الحل النهائي)
 # + عزل الملفات لكل مستخدم (client_id) + روابط كاملة للملفات
+# ★ عزل المستخدمين: مساحة لكل دردشة + sandbox للمسارات + files_changed + list_my_files
+#   + تقييد اختياري لأدوات الكود الحر (ADMIN_SECRET) + إلغاء «الوكيل الخارق» نهائياً
 # ★ FIX (هذه النسخة): /call لم يعد يعلّق التطبيق
 #     1) الدوال المتزامنة تعمل في thread بدل الـ event loop
 #     2) مهلة زمنية CALL_TIMEOUT لكل استدعاء (504 بدل التعليق)
@@ -22,14 +24,16 @@ import logging
 import traceback
 import shutil
 import hashlib
+import hmac
+import re
 import time
 import contextvars  # ★ NEW: لعزل الملفات
 from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 import httpx
-from fastapi import FastAPI, HTTPException, Header, UploadFile, File
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -105,6 +109,10 @@ COMPOSIO_BASE_URL = "https://backend.composio.dev/api/v3"
 COMPOSIO_BASE_URL_V31 = "https://backend.composio.dev/api/v3.1"
 
 APP_SECRET = os.environ.get("APP_SECRET", "")
+# مفتاح اختياري للمدير: عند ضبطه لا تعمل أدوات الكود الحر (RESTRICTED_TOOLS) إلا مع الهيدر X-Admin-Key
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
+# REQUIRE_AUTH=1 → يرفض الخادم /call و/upload إذا لم يُضبط APP_SECRET (fail-closed). الافتراضي: معطّل مؤقتاً.
+REQUIRE_AUTH = os.environ.get("REQUIRE_AUTH", "").strip().lower() in ("1", "true", "yes")
 SPACE_BASE_URL = os.environ.get("SPACE_BASE_URL", "")
 
 # ★ FIX: المهلة القصوى (بالثواني) لأي استدعاء في /call — قابلة للتعديل من متغير بيئة
@@ -164,64 +172,6 @@ def save_bytes(data: bytes, ext: str, client_id: str = None) -> str:
 
 
 # ══════════════════════════════════════════════════════════
-# ★ الوكيل الخارق (Super Agent Switch)
-# ══════════════════════════════════════════════════════════
-STATE_DIR = BASE_DIR / "state"
-STATE_DIR.mkdir(exist_ok=True)
-SUPER_AGENT_STATE_FILE = STATE_DIR / "super_agent.json"
-
-_super_agent_enabled: bool = True
-
-
-def _load_super_agent_state() -> None:
-    global _super_agent_enabled
-    try:
-        if SUPER_AGENT_STATE_FILE.exists():
-            data = json.loads(SUPER_AGENT_STATE_FILE.read_text(encoding="utf-8"))
-            _super_agent_enabled = bool(data.get("enabled", True))
-            logger.info(f"🔌 تم تحميل حالة الوكيل الخارق: enabled={_super_agent_enabled}")
-    except Exception as e:
-        logger.warning(f"تعذّر تحميل حالة الوكيل الخارق: {e}")
-        _super_agent_enabled = True
-
-
-def _save_super_agent_state() -> None:
-    try:
-        SUPER_AGENT_STATE_FILE.write_text(
-            json.dumps({"enabled": _super_agent_enabled}, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except Exception as e:
-        logger.warning(f"تعذّر حفظ حالة الوكيل الخارق: {e}")
-
-
-def is_super_agent_enabled() -> bool:
-    return _super_agent_enabled
-
-
-def set_super_agent_enabled(enabled: bool) -> Dict[str, Any]:
-    global _super_agent_enabled
-    _super_agent_enabled = bool(enabled)
-    _save_super_agent_state()
-
-    builtin_count = len(TOOLS_MANIFEST) if "TOOLS_MANIFEST" in globals() else 0
-    video_count = len(video_tool_names)
-    hub_count = len(registry.tool_routes) if hasattr(registry, "tool_routes") else 0
-
-    logger.info(
-        f"🔁 تم {'تفعيل' if _super_agent_enabled else 'تعطيل'} الوكيل الخارق — "
-        f"الأدوات={builtin_count + video_count + hub_count}"
-    )
-    return {
-        "enabled": _super_agent_enabled,
-        "affected_tools_count": builtin_count + video_count + hub_count,
-        "builtin_tools_count": builtin_count,
-        "video_tools_count": video_count,
-        "hub_tools_count": hub_count,
-    }
-
-
-# ══════════════════════════════════════════════════════════
 # TOOLS_MANIFEST (قبل استخدامه في _connect_video_mcp)
 # ══════════════════════════════════════════════════════════
 TOOLS_MANIFEST: List[Dict[str, Any]] = []
@@ -262,9 +212,9 @@ async def _connect_video_mcp() -> None:
             desc += (
                 "\n\n[ملاحظة مهمة]: هذه أداة فيديو/صوت تعمل على مسارات ملفات محلية "
                 "على الخادم فقط. استخدم fetch_media_to_file أولاً لتنزيل أي رابط "
-                "خارجي إلى مسار محلي، واكتب المخرجات دائماً داخل مجلد "
-                "/app/files/<اسم-فريد>.<امتداد> ليصبح الملف قابلاً للتحميل عبر "
-                "/files/<اسم-الملف>."
+                "خارجي إلى مسار محلي. اكتب المخرجات دائماً باسم ملف نسبي فقط "
+                "(مثل out.mp4) وسيُحفظ داخل مساحة هذه الدردشة؛ أي مسار خارج "
+                "مساحتك مرفوض. رابط التحميل = workspace_url (من رد /call) + اسم الملف."
             )
             TOOLS_MANIFEST.append({
                 "type": "function",
@@ -440,12 +390,33 @@ async def _background_startup() -> None:
             logger.warning(f"خطأ أثناء إغلاق الـ hub: {e!r}")
 
 
+def _log_runtime_versions() -> None:
+    """★ يسجل نسخ المكتبات الأساسية عند كل إقلاع: يكشف تغيّر الاعتماديات بعد rebuild."""
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+        parts = []
+        for pkg in ("mcp", "fastapi", "starlette", "uvicorn", "pydantic", "httpx", "reportlab", "python-docx", "python-pptx", "openpyxl"):
+            try:
+                parts.append(f"{pkg}={version(pkg)}")
+            except PackageNotFoundError:
+                parts.append(f"{pkg}=?")
+        import sys, subprocess
+        try:
+            node_v = subprocess.run(["node", "--version"], capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            node_v = "?"
+        logger.info(f"📌 Versions: python={sys.version.split()[0]} node={node_v} " + " ".join(parts))
+    except Exception as e:
+        logger.warning(f"تعذّر تسجيل النسخ: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _hub_stop, _hub_task, _font_task, _watchdog_task
-    _load_super_agent_state()
+    _log_runtime_versions()
     await auth.reload()
-    logger.info(f"🔌 حالة الوكيل الخارق عند الإقلاع: enabled={_super_agent_enabled}")
+    if not APP_SECRET:
+        logger.warning("⚠️ APP_SECRET غير مضبوط → /call و/upload مفتوحان لأي شخص. اضبطه كـ Secret في HF.")
 
     _hub_stop = asyncio.Event()
     _hub_task = asyncio.create_task(_background_startup())
@@ -1158,6 +1129,71 @@ def write_text_file(content: str, ext: str = "srt") -> dict:
 
 
 # ══════════════════════════════════════════════════════════
+# ★ تتبّع ملفات الدردشة: ما الذي تغيّر في هذا الاستدعاء + قائمة ملفاتي
+#   يحل مشكلة «الوكيل يخطئ في تحديد الملف المستعمل»: كل رد يذكر الملفات الجديدة/المعدّلة بروابطها.
+# ══════════════════════════════════════════════════════════
+def _snapshot(ws: Path, limit: int = 5000) -> Dict[str, tuple]:
+    """لقطة {المسار النسبي: (mtime_ns, size)} لكل ملفات المساحة (بدون تتبّع symlinks)."""
+    out: Dict[str, tuple] = {}
+    stack = [ws]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(Path(e.path))
+                    elif e.is_file(follow_symlinks=False):
+                        st = e.stat(follow_symlinks=False)
+                        out[str(Path(e.path).relative_to(ws))] = (st.st_mtime_ns, st.st_size)
+                        if len(out) >= limit:
+                            return out
+        except OSError:
+            continue
+    return out
+
+
+def _diff_snapshots(before: Dict[str, tuple], after: Dict[str, tuple], ws_name: str, limit: int = 50) -> List[Dict[str, Any]]:
+    changed: List[Dict[str, Any]] = []
+    for rel, meta in after.items():
+        old = before.get(rel)
+        if old == meta:
+            continue
+        changed.append({
+            "path": rel,
+            "size": meta[1],
+            "status": "new" if old is None else "modified",
+            "url": _full_file_url(f"/files/{ws_name}/{quote(rel)}"),
+        })
+        if len(changed) >= limit:
+            break
+    return changed
+
+
+def list_my_files(limit: int = 100) -> dict:
+    """ملفات هذه الدردشة فقط (الأحدث أولاً) مع المسار المحلي والرابط."""
+    from datetime import datetime, timezone
+    ws = workspace_for(_current_client_id.get())
+    snap = _snapshot(ws)
+    n = max(1, min(int(limit), 500))
+    items = sorted(snap.items(), key=lambda kv: kv[1][0], reverse=True)[:n]
+    return {
+        "workspace_url": _full_file_url(f"/files/{ws.name}/"),
+        "total_files": len(snap),
+        "files": [
+            {
+                "path": rel,
+                "local_path": str(ws / rel),
+                "size": meta[1],
+                "modified": datetime.fromtimestamp(meta[0] / 1e9, tz=timezone.utc).isoformat(),
+                "url": _full_file_url(f"/files/{ws.name}/{quote(rel)}"),
+            }
+            for rel, meta in items
+        ],
+    }
+
+
+# ══════════════════════════════════════════════════════════
 # سجل TOOL_FUNCTIONS
 # ══════════════════════════════════════════════════════════
 TOOL_FUNCTIONS = {
@@ -1184,6 +1220,7 @@ TOOL_FUNCTIONS = {
     "markdown_to_html": markdown_to_html,
     "fetch_media_to_file": fetch_media_to_file,
     "write_text_file": write_text_file,
+    "list_my_files": list_my_files,
 }
 
 
@@ -1386,6 +1423,13 @@ TOOLS_MANIFEST.extend([
             "ext": {"type": "string", "default": "srt"},
         }, "required": ["content"]},
     }},
+    {"type": "function", "function": {
+        "name": "list_my_files",
+        "description": "يعرض ملفات هذه الدردشة فقط (الأحدث أولاً) مع المسار المحلي والرابط. استعمله لمعرفة الملف الصحيح بدل التخمين.",
+        "parameters": {"type": "object", "properties": {
+            "limit": {"type": "integer", "default": 100},
+        }},
+    }},
 ])
 
 
@@ -1397,13 +1441,140 @@ class CallRequest(BaseModel):
     arguments: Dict[str, Any] = Field(default_factory=dict)
 
 
-class SuperAgentToggleRequest(BaseModel):
-    enabled: bool
-
-
 def _check_auth(x_api_key: str) -> None:
-    if APP_SECRET and x_api_key != APP_SECRET:
+    if not APP_SECRET:
+        if REQUIRE_AUTH:
+            raise HTTPException(503, "APP_SECRET غير مضبوط على الخادم (REQUIRE_AUTH=1)")
+        return
+    # مقارنة ثابتة الزمن
+    if not hmac.compare_digest((x_api_key or "").encode(), APP_SECRET.encode()):
         raise HTTPException(401, "غير مصرح: مفتاح API غير صحيح أو مفقود (X-API-Key)")
+
+
+# ══════════════════════════════════════════════════════════
+# ★ هوية العميل (عزل الملفات)
+#   بدون X-Client-Id ولا X-API-Key كل المستخدمين يُحشرون في مجلد واحد: files/anonymous/
+#   REQUIRE_CLIENT_ID=1  → يرفض /call بدون هوية (400) بدل الكتابة في anonymous.
+# ══════════════════════════════════════════════════════════
+_CLIENT_ID_HEADERS = ("x-client-id", "x-session-id", "x-user-id", "x-conversation-id", "x-thread-id")
+REQUIRE_CLIENT_ID = os.environ.get("REQUIRE_CLIENT_ID", "").strip().lower() in ("1", "true", "yes")
+_stats: Dict[str, int] = {"anonymous_calls": 0}
+
+
+def _safe_client_name(client_id: str) -> str:
+    return "".join(c for c in (client_id or "") if c.isalnum() or c in "-_")[:32] or "anonymous"
+
+
+def _resolve_client_id(request: Request, x_api_key: str):
+    """يعيد (client_id, مصدر الهوية). المصدر 'none' = لا هوية → anonymous."""
+    for h in _CLIENT_ID_HEADERS:
+        v = (request.headers.get(h) or "").strip()
+        if v:
+            return v, h
+    if x_api_key:
+        return hashlib.sha256(x_api_key.encode()).hexdigest()[:16], "api-key-hash"
+    return "anonymous", "none"
+
+
+# ══════════════════════════════════════════════════════════
+# ★ عزل المستخدمين: مساحة عمل لكل دردشة + sandbox للمسارات + تقييد اختياري لأدوات الكود الحر
+#   نقطة فرض واحدة داخل /call — لا تغيير في الأدوات نفسها.
+#   (هوية العميل _resolve_client_id وأدوات tools.py المحلية معزولة أصلاً أعلاه وفي hub.py)
+#   ملاحظة: هذا عزل ضد الخلط والأخطاء (best-effort)، وليس حاجزاً ضد مستخدم خبيث.
+# ══════════════════════════════════════════════════════════
+# أدوات تنفّذ كوداً حراً (تكسر العزل). تعمل لأي أحد ما لم تضبط ADMIN_SECRET؛
+# وعند ضبطه لا تعمل إلا لمن يرسل الهيدر X-Admin-Key بنفس القيمة.
+RESTRICTED_TOOLS = {t.strip() for t in os.environ.get("RESTRICTED_TOOLS", "run__run-code,ken__eval_js").split(",") if t.strip()}
+
+# مجلدات إضافية مسموح استعمالها كما هي (مثلاً الخطوط): SANDBOX_EXTRA_ROOTS=/usr/share/fonts:/app/assets
+_EXTRA_ROOTS = [Path(x).resolve() for x in os.environ.get("SANDBOX_EXTRA_ROOTS", "").split(":") if x.strip()]
+
+_PATH_TOKEN = re.compile(
+    r"(?:^|_)(?:path|paths|dir|dirs|directory|folder|file|files|source|destination|dest|clips|input|output)$"
+)
+
+
+def _is_admin(x_admin_key: str) -> bool:
+    return bool(ADMIN_SECRET) and hmac.compare_digest((x_admin_key or "").encode(), ADMIN_SECRET.encode())
+
+
+def _is_restricted_denied(tool: str, x_admin_key: str) -> bool:
+    """True إذا كانت الأداة مقيّدة والمتصل ليس admin (يُطبَّق فقط عند ضبط ADMIN_SECRET)."""
+    return bool(ADMIN_SECRET) and tool in RESTRICTED_TOOLS and not _is_admin(x_admin_key)
+
+
+def workspace_for(client_id: str) -> Path:
+    """مساحة الدردشة: files/<نفس اسم المجلد الذي تستعمله save_bytes و/upload و hub.py>."""
+    ws = (FILES_DIR / _safe_client_name(client_id)).resolve()
+    ws.mkdir(parents=True, exist_ok=True)
+    return ws
+
+
+def _is_path_key(key: str, extra=frozenset()) -> bool:
+    if key in extra:
+        return True
+    snake = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key)).lower()
+    return bool(_PATH_TOKEN.search(snake))
+
+
+def _schema_path_keys(schema) -> frozenset:
+    """أسماء الوسائط التي يصفها schema الأداة بأنها مسار/مجلد (مكمّل للتخمين بالاسم)."""
+    props = (schema or {}).get("properties") or {}
+    out = set()
+    for k, v in props.items():
+        desc = (v.get("description") or "").lower() if isinstance(v, dict) else ""
+        if any(w in desc for w in ("path", "directory", "folder", "filesystem", "file system")):
+            out.add(k)
+    return frozenset(out)
+
+
+def _confine(value: str, ws: Path) -> str:
+    v = value.strip()
+    if not v:
+        return value
+    low = v.lower()
+    if low.startswith(("http://", "https://", "data:")):
+        return value
+    if "://" in v or low.startswith("file:"):
+        raise HTTPException(403, "بروتوكول غير مسموح في المسارات")
+    p = Path(v)
+    if p.is_absolute():
+        rp = p.resolve()
+        files_root = FILES_DIR.resolve()
+        if rp == ws or ws in rp.parents:
+            return str(rp)
+        if any(r == rp or r in rp.parents for r in _EXTRA_ROOTS):
+            return str(rp)
+        if rp == files_root or files_root in rp.parents:
+            # مسار تحت /app/files لكن خارج مساحة هذه الدردشة → يُعاد توجيهه داخل مساحتها
+            p = Path(*rp.relative_to(files_root).parts)
+        else:
+            raise HTTPException(403, "مسار خارج مساحة هذه الدردشة")
+    rp = (ws / p).resolve()
+    if rp != ws and ws not in rp.parents:
+        raise HTTPException(403, "مسار خارج مساحة هذه الدردشة")
+    return str(rp)
+
+
+def _sandbox(obj, ws: Path, key: str = "", extra=frozenset()):
+    """يحصر كل قيمة مسار داخل الوسائط في مساحة الدردشة. extra يُطبَّق على المستوى الأعلى فقط."""
+    if isinstance(obj, dict):
+        child_extra = extra if key == "" else frozenset()
+        return {k: _sandbox(v, ws, str(k), child_extra) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sandbox(v, ws, key, frozenset()) for v in obj]
+    if isinstance(obj, str):
+        if key == "timeline":
+            t = obj.strip()
+            if t and t[0] in "{[":
+                try:
+                    return json.dumps(_sandbox(json.loads(t), ws, "", frozenset()), ensure_ascii=False)
+                except ValueError:
+                    return obj
+            return _confine(obj, ws)
+        if _is_path_key(key, extra):
+            return _confine(obj, ws)
+    return obj
 
 
 # ══════════════════════════════════════════════════════════
@@ -1438,85 +1609,14 @@ async def health():
         "hub_ready": _hub_state["ready"],
         "hub_startup_errors": (_hub_state.get("result") or {}).get("errors", {}),
         "hub_servers": len(registry.servers) if hasattr(registry, 'servers') else 0,
-        "super_agent_enabled": is_super_agent_enabled(),
         "files_isolation": True,
+        "anonymous_calls": _stats["anonymous_calls"],
+        "require_client_id": REQUIRE_CLIENT_ID,
+        "auth_required": REQUIRE_AUTH,
+        "restricted_tools_need_admin": bool(ADMIN_SECRET),
         "space_base_url_set": bool(SPACE_BASE_URL),
         "call_timeout_seconds": CALL_TIMEOUT,
     }
-
-
-@app.get("/super-agent/status")
-async def super_agent_status(x_api_key: str = Header(default="")):
-    _check_auth(x_api_key)
-    builtin_count = len(TOOLS_MANIFEST)
-    hub_count = len(registry.tool_routes) if hasattr(registry, "tool_routes") else 0
-    return {
-        "enabled": is_super_agent_enabled(),
-        "builtin_tools_count": builtin_count,
-        "video_tools_count": len(video_tool_names),
-        "hub_tools_count": hub_count,
-        "total_tools_count": builtin_count + hub_count,
-    }
-
-
-@app.post("/super-agent/toggle")
-async def super_agent_toggle(req: SuperAgentToggleRequest, x_api_key: str = Header(default="")):
-    _check_auth(x_api_key)
-    summary = set_super_agent_enabled(req.enabled)
-    return {"ok": True, **summary}
-
-
-@app.get("/super-agent/enable")
-async def super_agent_enable(x_api_key: str = Header(default="")):
-    _check_auth(x_api_key)
-    summary = set_super_agent_enabled(True)
-    return {"ok": True, **summary}
-
-
-@app.get("/super-agent/disable")
-async def super_agent_disable(x_api_key: str = Header(default="")):
-    _check_auth(x_api_key)
-    summary = set_super_agent_enabled(False)
-    return {"ok": True, **summary}
-
-
-@app.get("/super-agent", response_class=HTMLResponse)
-async def super_agent_page():
-    return """
-    <!DOCTYPE html>
-    <html lang="ar" dir="rtl"><head><meta charset="utf-8">
-    <title>الوكيل الخارق</title>
-    <style>
-        body{font-family:sans-serif;text-align:center;padding-top:60px;background:#0f0f0f;color:#eee;}
-        button{font-size:18px;padding:14px 28px;margin:10px;border:none;border-radius:8px;cursor:pointer;}
-        #on{background:#1e8e3e;color:#fff;}
-        #off{background:#c62828;color:#fff;}
-        #status{margin-top:20px;font-size:16px;color:#aaa;}
-    </style></head>
-    <body>
-        <h2>⚡ الوكيل الخارق</h2>
-        <p id="status">...جاري التحقق من الحالة</p>
-        <div>
-            <button id="on" onclick="setState(true)">✅ تفعيل الكل</button>
-            <button id="off" onclick="setState(false)">🛑 تعطيل الكل</button>
-        </div>
-        <script>
-        async function refresh(){
-            const r = await fetch('/super-agent/status');
-            const d = await r.json();
-            document.getElementById('status').innerText =
-                (d.enabled ? '🟢 الحالة: مفعّل — ' : '🔴 الحالة: معطّل — ') +
-                'إجمالي الأدوات: ' + (d.total_tools_count ?? '?');
-        }
-        async function setState(enabled){
-            document.getElementById('status').innerText = '...جاري التنفيذ';
-            await fetch(enabled ? '/super-agent/enable' : '/super-agent/disable');
-            await refresh();
-        }
-        refresh();
-        </script>
-    </body></html>
-    """
 
 
 # ══════════════════════════════════════════════════════════
@@ -1534,7 +1634,7 @@ except ValueError:
 HIDE_TOOL_PREFIXES = tuple(
     p.strip() for p in os.environ.get("HIDE_TOOL_PREFIXES", "").split(",") if p.strip()
 )
-_tools_cache: Dict[str, Any] = {"key": None, "body": b""}
+_tools_cache: Dict[Any, bytes] = {}
 
 
 def _slim_schema(node, is_props: bool = False):
@@ -1557,7 +1657,7 @@ def _shorten(text: str) -> str:
     return text
 
 
-def _build_tools_body() -> bytes:
+def _build_tools_body(include_restricted: bool = True) -> bytes:
     all_tools = list(TOOLS_MANIFEST)
     seen_names = {t["function"]["name"] for t in all_tools}
 
@@ -1566,6 +1666,8 @@ def _build_tools_body() -> bytes:
             if tool_name in seen_names:
                 continue
             if HIDE_TOOL_PREFIXES and tool_name.startswith(HIDE_TOOL_PREFIXES):
+                continue
+            if not include_restricted and tool_name in RESTRICTED_TOOLS:
                 continue
             # أدوات video-audio-mcp تظهر مرتين (بدون prefix من الاتصال المباشر + video__* من الـ hub):
             # نخفي نسخة الـ hub من القائمة فقط (تبقى قابلة للاستدعاء) إن كان الاتصال المباشر شغالاً.
@@ -1587,7 +1689,7 @@ def _build_tools_body() -> bytes:
                 logger.warning(f"Skipping tool {tool_name} due to error: {e}")
 
     body = json.dumps(
-        {"tools": all_tools, "super_agent_enabled": True},
+        {"tools": all_tools},
         ensure_ascii=False, separators=(",", ":"),
     ).encode("utf-8")
     logger.info(f"📦 /tools payload: {len(body) / 1024:.0f}KB, {len(all_tools)} tools")
@@ -1595,23 +1697,20 @@ def _build_tools_body() -> bytes:
 
 
 @app.get("/tools")
-async def list_tools():
-    if not is_super_agent_enabled():
-        return {
-            "tools": [],
-            "super_agent_enabled": False,
-            "message": "الوكيل الخارق معطّل — فعّله عبر /super-agent/toggle.",
-        }
-
+async def list_tools(x_admin_key: str = Header(default="")):
+    # عند ضبط ADMIN_SECRET تُخفى أدوات الكود الحر عمّن لا يملك X-Admin-Key
+    include_restricted = (not ADMIN_SECRET) or _is_admin(x_admin_key)
     key = (
         len(TOOLS_MANIFEST),
         len(registry.tool_routes) if hasattr(registry, "tool_routes") else 0,
-        bool(video_session), TOOLS_DESC_MAX, HIDE_TOOL_PREFIXES,
+        bool(video_session), TOOLS_DESC_MAX, HIDE_TOOL_PREFIXES, include_restricted,
     )
-    if _tools_cache["key"] != key:
-        _tools_cache["body"] = _build_tools_body()
-        _tools_cache["key"] = key
-    return Response(content=_tools_cache["body"], media_type="application/json")
+    body = _tools_cache.get(key)
+    if body is None:
+        if len(_tools_cache) > 8:
+            _tools_cache.clear()
+        body = _tools_cache[key] = _build_tools_body(include_restricted)
+    return Response(content=body, media_type="application/json")
 
 
 @app.get("/oauth-callback-close")
@@ -1640,6 +1739,7 @@ ALLOWED_UPLOAD_EXTS = {
 
 @app.post("/upload")
 async def upload_file(
+    request: Request,
     file: UploadFile = File(...),
     x_api_key: str = Header(default=""),
     x_client_id: str = Header(default=""),
@@ -1654,9 +1754,7 @@ async def upload_file(
         )
 
     # ★ عزل الملفات بحسب client_id
-    cid = x_client_id.strip() or (
-        hashlib.sha256(x_api_key.encode()).hexdigest()[:16] if x_api_key else "anonymous"
-    )
+    cid, _src = _resolve_client_id(request, x_api_key)
     safe_client = "".join(c for c in cid if c.isalnum() or c in "-_")[:32] or "anonymous"
     user_dir = FILES_DIR / safe_client
     user_dir.mkdir(parents=True, exist_ok=True)
@@ -1715,23 +1813,48 @@ async def composio_disconnect_endpoint(
 @app.post("/call")
 async def call_tool(
     req: CallRequest,
+    request: Request,
+    response: Response,
     x_api_key: str = Header(default=""),
     x_client_id: str = Header(default=""),
+    x_admin_key: str = Header(default=""),
 ):
     _check_auth(x_api_key)
 
-    if not is_super_agent_enabled():
-        raise HTTPException(
-            403,
-            "الوكيل الخارق معطّل — فعّله عبر POST /super-agent/toggle {\"enabled\": true}.",
-        )
-
     # ★ حساب client_id وضبطه في السياق لتعزيل الملفات
-    client_id = (
-        x_client_id.strip()
-        or (hashlib.sha256(x_api_key.encode()).hexdigest()[:16] if x_api_key else "anonymous")
-    )
+    client_id, id_source = _resolve_client_id(request, x_api_key)
+    if id_source == "none":
+        _stats["anonymous_calls"] += 1
+        if REQUIRE_CLIENT_ID:
+            raise HTTPException(
+                400,
+                "هوية العميل مفقودة: أرسل الهيدر X-Client-Id (معرّف المستخدم/الجلسة) مع كل طلب /call.",
+            )
+        if _stats["anonymous_calls"] % 100 == 1:
+            logger.warning(
+                "⚠️ /call بدون X-Client-Id ولا X-API-Key → الملفات تُحفظ في files/anonymous "
+                f"(مشتركة بين كل المستخدمين). عدد هذه الطلبات: {_stats['anonymous_calls']}"
+            )
+    response.headers["X-Client-Id-Used"] = _safe_client_name(client_id)
     _current_client_id.set(client_id)
+
+    # ★ أدوات الكود الحر: لمن يملك X-Admin-Key فقط (عند ضبط ADMIN_SECRET)
+    if _is_restricted_denied(req.tool, x_admin_key):
+        raise HTTPException(403, f"الأداة {req.tool} مقيّدة (تتطلب X-Admin-Key)")
+
+    ws = workspace_for(client_id)
+    ws_url = _full_file_url(f"/files/{ws.name}/")
+
+    before = await asyncio.to_thread(_snapshot, ws)
+
+    async def ok(result):
+        after = await asyncio.to_thread(_snapshot, ws)
+        return {
+            "ok": True,
+            "result": result,
+            "workspace_url": ws_url,
+            "files_changed": _diff_snapshots(before, after, ws.name),
+        }
 
     # 1. أدوات الفيديو
     if req.tool in video_tool_names:
@@ -1739,8 +1862,13 @@ async def call_tool(
             raise HTTPException(503, "خادم أدوات الفيديو غير متصل")
         try:
             # ★ FIX: مهلة زمنية
-            result_text = await _run(_call_video_tool(req.tool, req.arguments), req.tool)
-            return {"ok": True, "result": result_text}
+            # نحلّ أسماء الوسائط أولاً ثم نحصر المسارات (حتى لا يتجاوز التخمين الـ sandbox)
+            v_args = _sandbox(
+                _resolve_video_args(req.tool, req.arguments), ws,
+                extra=_schema_path_keys(video_tool_schemas.get(req.tool)),
+            )
+            result_text = await _run(_call_video_tool(req.tool, v_args), req.tool)
+            return await ok(result_text)
         except HTTPException:
             raise
         except Exception as e:
@@ -1756,7 +1884,7 @@ async def call_tool(
                 # ★ FIX: الدوال المتزامنة (pdf/docx/xlsx/...) في thread حتى لا تبلوكي الـ event loop
                 # (to_thread ينسخ contextvars، فعزل الملفات per-client يبقى يعمل)
                 result = await _run(asyncio.to_thread(fn, **req.arguments), req.tool)
-            return {"ok": True, "result": result}
+            return await ok(result)
         except HTTPException:
             raise
         except ValueError as e:
@@ -1773,15 +1901,21 @@ async def call_tool(
     # ★ FIX: لا نطبع قائمة المسارات الكاملة (250+ اسم) في كل استدعاء
     logger.info(f"Incoming tool = {req.tool}")
 
-    if req.tool not in registry.tool_routes:
+    route = registry.tool_routes.get(req.tool)
+    if route is None:
         logger.warning(f"Tool '{req.tool}' not found in hub routes")
+    # ★ حصر كل مسار في مساحة الدردشة قبل وصوله لأي سيرفر MCP
+    h_args = _sandbox(
+        req.arguments, ws,
+        extra=_schema_path_keys(getattr(route, "input_schema", None)),
+    )
 
     context = AccessContext(client_id=client_id)
 
     try:
         # ★ FIX: مهلة زمنية للأدوات الثقيلة (render / nmap / ...)
-        result = await _run(registry.call_tool(req.tool, req.arguments, context), req.tool)
-        return {"ok": True, "result": result}
+        result = await _run(registry.call_tool(req.tool, h_args, context), req.tool)
+        return await ok(result)
     except HTTPException:
         raise
     except Exception as e:
