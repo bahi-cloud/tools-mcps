@@ -25,16 +25,17 @@ import traceback
 import shutil
 import hashlib
 import hmac
+import fnmatch
 import re
 import time
 import contextvars  # ★ NEW: لعزل الملفات
 from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
-from typing import Optional, List, Dict, Any
-from urllib.parse import urlparse, quote
+from typing import Optional, List, Dict, Any, NamedTuple, Tuple
+from urllib.parse import urlparse, quote, unquote
 import httpx
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -115,6 +116,15 @@ ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
 REQUIRE_AUTH = os.environ.get("REQUIRE_AUTH", "").strip().lower() in ("1", "true", "yes")
 SPACE_BASE_URL = os.environ.get("SPACE_BASE_URL", "")
 
+# ★ روابط /files الموقّعة (HMAC + انتهاء). SIGN_FILE_URLS=1 يفعّلها؛ الافتراضي معطّل حتى لا تنكسر الروابط القديمة.
+#   المفتاح: FILE_SIGNING_KEY (أو APP_SECRET كبديل). مدة الصلاحية: FILE_URL_TTL_DAYS (افتراضي 30).
+SIGN_FILE_URLS = os.environ.get("SIGN_FILE_URLS", "").strip().lower() in ("1", "true", "yes")
+FILE_SIGNING_KEY = os.environ.get("FILE_SIGNING_KEY", "") or APP_SECRET
+try:
+    FILE_URL_TTL_SECONDS = int(float(os.environ.get("FILE_URL_TTL_DAYS", "30")) * 86400)
+except ValueError:
+    FILE_URL_TTL_SECONDS = 30 * 86400
+
 # ★ FIX: المهلة القصوى (بالثواني) لأي استدعاء في /call — قابلة للتعديل من متغير بيئة
 try:
     CALL_TIMEOUT = int(os.environ.get("CALL_TIMEOUT", "120"))
@@ -140,12 +150,51 @@ def _get_composio_default_user_id() -> str:
 # ★ دوال عزل الملفات والروابط الكاملة
 # ══════════════════════════════════════════════════════════
 
+def _file_sig(path: str, exp: int) -> str:
+    return hmac.new(FILE_SIGNING_KEY.encode(), f"{path}|{exp}".encode(), hashlib.sha256).hexdigest()[:40]
+
+
+def _verify_file_sig(path: str, exp: int, sig: str) -> bool:
+    if not (SIGN_FILE_URLS and FILE_SIGNING_KEY) or exp < int(time.time()):
+        return False
+    return hmac.compare_digest(_file_sig(path, exp), sig or "")
+
+
+def _sign_path(path: str) -> str:
+    """يضيف ?exp=&sig= لمسار /files/... (يوقّع النسخة غير المرمّزة من المسار)."""
+    if not (SIGN_FILE_URLS and FILE_SIGNING_KEY) or not path.startswith("/files/") or "sig=" in path:
+        return path
+    exp = int(time.time()) + FILE_URL_TTL_SECONDS
+    return f"{path}?exp={exp}&sig={_file_sig(unquote(path), exp)}"
+
+
+def _resign_url(url: str) -> str:
+    m = _re_files_url.match(url or "")
+    return (m.group(1) or "") + _sign_path(m.group(2)) if m else url
+
+
+_re_files_url = re.compile(r"^(https?://[^/]+)?(/files/[^?#]*)$")
+
+
+def _sign_result_urls(obj):
+    """يوقّع أي file_url/url يشير إلى /files داخل نتيجة أداة (مثلاً أدوات tools.py عبر الـ hub)."""
+    if isinstance(obj, dict):
+        return {
+            k: (_resign_url(v) if k in ("file_url", "url") and isinstance(v, str) else _sign_result_urls(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_sign_result_urls(x) for x in obj]
+    return obj
+
+
 def _full_file_url(relative_path: str) -> str:
-    """★ يحول المسار النسبي إلى رابط كامل باستخدام SPACE_BASE_URL."""
+    """★ يحول المسار النسبي إلى رابط كامل باستخدام SPACE_BASE_URL (ويوقّعه عند SIGN_FILE_URLS)."""
     if not relative_path:
         return ""
     if relative_path.startswith("http"):
         return relative_path
+    relative_path = _sign_path(relative_path)
     base = SPACE_BASE_URL.rstrip("/") if SPACE_BASE_URL else ""
     return f"{base}{relative_path}" if base else relative_path
 
@@ -159,7 +208,7 @@ def save_bytes(data: bytes, ext: str, client_id: str = None) -> str:
         client_id = _current_client_id.get()
 
     # تنظيف client_id لمنع أي محاولة اختراق مسار (Path Traversal)
-    safe_client = "".join(c for c in client_id if c.isalnum() or c in "-_")[:32] or "anonymous"
+    safe_client = _safe_client_name(client_id)
 
     # إنشاء مجلد المستخدم إذا لم يكن موجوداً
     user_dir = FILES_DIR / safe_client
@@ -458,7 +507,21 @@ async def _security_headers(request, call_next):
     return response
 
 
-app.mount("/files", StaticFiles(directory=str(FILES_DIR)), name="files")
+if SIGN_FILE_URLS and FILE_SIGNING_KEY:
+    @app.get("/files/{file_path:path}")
+    async def serve_signed_file(file_path: str, exp: int = 0, sig: str = ""):
+        """★ لا يُخدَّم أي ملف بدون رابط موقّع صالح (exp + sig)."""
+        if not _verify_file_sig(f"/files/{file_path}", exp, sig):
+            raise HTTPException(403, "رابط غير صالح أو منتهي الصلاحية")
+        root = FILES_DIR.resolve()
+        target = (root / file_path).resolve()
+        if root not in target.parents or not target.is_file():
+            raise HTTPException(404, "الملف غير موجود")
+        return FileResponse(target)
+else:
+    if SIGN_FILE_URLS:
+        logger.warning("⚠️ SIGN_FILE_URLS=1 لكن لا يوجد FILE_SIGNING_KEY ولا APP_SECRET → /files يبقى مفتوحاً")
+    app.mount("/files", StaticFiles(directory=str(FILES_DIR)), name="files")
 
 
 def move_to_files(source_path: str, filename: str = None) -> str:
@@ -1441,45 +1504,174 @@ class CallRequest(BaseModel):
     arguments: Dict[str, Any] = Field(default_factory=dict)
 
 
-def _check_auth(x_api_key: str) -> None:
-    if not APP_SECRET:
-        if REQUIRE_AUTH:
-            raise HTTPException(503, "APP_SECRET غير مضبوط على الخادم (REQUIRE_AUTH=1)")
-        return
-    # مقارنة ثابتة الزمن
-    if not hmac.compare_digest((x_api_key or "").encode(), APP_SECRET.encode()):
-        raise HTTPException(401, "غير مصرح: مفتاح API غير صحيح أو مفقود (X-API-Key)")
+def _check_auth(x_api_key: str) -> str:
+    """يتحقق من المفتاح (APP_SECRET أو مفتاح مستخدم من clients.json) ويعيد النوع: master | user | open."""
+    return _auth_kind(x_api_key)[0]
+
+
+def _check_master(x_api_key: str) -> None:
+    """عمليات إدارية (مثل /composio/disconnect): لا تسمح بمفاتيح المستخدمين العاديين."""
+    if _auth_kind(x_api_key)[0] == "user":
+        raise HTTPException(403, "هذه العملية لمفتاح المدير (APP_SECRET) فقط")
 
 
 # ══════════════════════════════════════════════════════════
-# ★ هوية العميل (عزل الملفات)
-#   بدون X-Client-Id ولا X-API-Key كل المستخدمين يُحشرون في مجلد واحد: files/anonymous/
-#   REQUIRE_CLIENT_ID=1  → يرفض /call بدون هوية (400) بدل الكتابة في anonymous.
+# ★ هوية العميل: مستخدم + دردشة  (client_id = "<user>__<chat>")
+#   وضعان يعملان معاً:
+#   1) مفتاح لكل مستخدم: clients.json (أو سر CLIENT_KEYS_JSON) يحوي sha256(المفتاح) فقط.
+#      المستخدم يحدده المفتاح (لا يمكن انتحاله)، والدردشة تُؤخذ من الهيدر داخل مساحته.
+#   2) بوابة موثوقة: الواجهة (backend) تحمل APP_SECRET وترسل X-User-Id و X-Chat-Id (أو X-Client-Id).
+#   بدون أي سر مضبوط: وضع انتقالي مفتوح (يعتمد الهيدرز كما هي).
 # ══════════════════════════════════════════════════════════
-_CLIENT_ID_HEADERS = ("x-client-id", "x-session-id", "x-user-id", "x-conversation-id", "x-thread-id")
+_CHAT_HEADERS = ("x-client-id", "x-chat-id", "x-conversation-id", "x-thread-id", "x-session-id")
+_USER_HEADERS = ("x-user-id",)
 REQUIRE_CLIENT_ID = os.environ.get("REQUIRE_CLIENT_ID", "").strip().lower() in ("1", "true", "yes")
 _stats: Dict[str, int] = {"anonymous_calls": 0}
 
+# أدوات ممنوعة افتراضياً على مفاتيح المستخدمين (Composio حسابات المالك المشتركة). تُعدَّل بـ USER_DENY أو "deny" في سجل المستخدم.
+DEFAULT_USER_DENY: Tuple[str, ...] = tuple(x.strip() for x in os.environ.get("USER_DENY", "composio_*").split(",") if x.strip())
+
+CLIENTS_FILE = BASE_DIR / "clients.json"
+_clients_cache: Dict[str, Any] = {"sig": None, "data": {}}
+
 
 def _safe_client_name(client_id: str) -> str:
-    return "".join(c for c in (client_id or "") if c.isalnum() or c in "-_")[:32] or "anonymous"
+    """اسم مجلد آمن وثابت لكل هوية (ASCII فقط). يجب أن تطابق نسخة hub.py تماماً."""
+    cid = (client_id or "").strip()
+    if not cid:
+        return "anonymous"
+    clean = "".join(c for c in cid if c.isascii() and (c.isalnum() or c in "-_"))
+    if clean != cid or len(clean) > 64:
+        return "c_" + hashlib.sha256(cid.encode("utf-8")).hexdigest()[:32]
+    return clean
 
 
-def _resolve_client_id(request: Request, x_api_key: str):
-    """يعيد (client_id, مصدر الهوية). المصدر 'none' = لا هوية → anonymous."""
-    for h in _CLIENT_ID_HEADERS:
+def _clean_part(value: str, max_len: int) -> str:
+    """ينظّف جزءاً من الهوية (user أو chat) بحيث لا يحوي '__' ولا رموزاً غريبة؛ يضيف hash عند التغيير/الاقتطاع."""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    clean = re.sub(r"[^A-Za-z0-9_-]+", "-", v)
+    clean = re.sub(r"_{2,}", "_", clean).strip("_-") or "x"
+    if clean == v and len(clean) <= max_len:
+        return clean
+    suffix = hashlib.sha1(v.encode("utf-8")).hexdigest()[:8]
+    return clean[: max_len - 9].rstrip("_-") + "-" + suffix
+
+
+def _compose(user: str, chat: str) -> str:
+    return f"{user}__{chat}" if user and chat else (user or chat)
+
+
+def _load_clients() -> Dict[str, Dict[str, Any]]:
+    """{sha256(key): {"user","enabled","admin","deny"}} من clients.json ثم CLIENT_KEYS_JSON (يعاد التحميل عند تغيّر الملف)."""
+    try:
+        st = CLIENTS_FILE.stat()
+        file_sig: Any = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        file_sig = None
+    env_raw = os.environ.get("CLIENT_KEYS_JSON", "")
+    sig = (file_sig, hash(env_raw))
+    if _clients_cache["sig"] == sig:
+        return _clients_cache["data"]
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    sources = []
+    if file_sig is not None:
+        try:
+            sources.append(json.loads(CLIENTS_FILE.read_text(encoding="utf-8")))
+        except Exception as e:
+            logger.error(f"clients.json غير صالح: {e}")
+    if env_raw.strip():
+        try:
+            sources.append(json.loads(env_raw))
+        except Exception as e:
+            logger.error(f"CLIENT_KEYS_JSON غير صالح: {e}")
+    for doc in sources:
+        entries = doc.get("clients", doc) if isinstance(doc, dict) else {}
+        for key_hash, rec in (entries or {}).items():
+            if not isinstance(rec, dict) or not isinstance(key_hash, str) or len(key_hash) != 64:
+                continue
+            user = _clean_part(str(rec.get("user", "")), 24)
+            if not user:
+                continue
+            merged[key_hash.lower()] = {**rec, "user": user}
+    _clients_cache["sig"], _clients_cache["data"] = sig, merged
+    logger.info(f"👥 clients loaded: {len(merged)}")
+    return merged
+
+
+def _lookup_user(api_key: str) -> Optional[Dict[str, Any]]:
+    if not api_key:
+        return None
+    rec = _load_clients().get(hashlib.sha256(api_key.encode("utf-8")).hexdigest())
+    return rec if rec and rec.get("enabled", True) else None
+
+
+def _auth_kind(x_api_key: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """('master'|'user'|'open', سجل المستخدم). يرفع 401 للمفتاح الخاطئ عند وجود أي سر/مستخدمين، و503 مع REQUIRE_AUTH."""
+    key = x_api_key or ""
+    if APP_SECRET and hmac.compare_digest(key.encode(), APP_SECRET.encode()):
+        return "master", None
+    rec = _lookup_user(key)
+    if rec:
+        return "user", rec
+    if APP_SECRET or _load_clients():
+        raise HTTPException(401, "غير مصرح: مفتاح API غير صحيح أو مفقود (X-API-Key)")
+    if REQUIRE_AUTH:
+        raise HTTPException(503, "لا يوجد APP_SECRET ولا مستخدمون مضبوطون (REQUIRE_AUTH=1)")
+    return "open", None
+
+
+class Identity(NamedTuple):
+    client_id: str
+    source: str
+    kind: str
+    user: str
+    is_admin: bool
+    deny: Tuple[str, ...]
+
+
+def _first_header(request: Request, names) -> Tuple[str, str]:
+    for h in names:
         v = (request.headers.get(h) or "").strip()
         if v:
             return v, h
+    return "", ""
+
+
+def _identify(request: Request, x_api_key: str, x_admin_key: str = "") -> Identity:
+    kind, rec = _auth_kind(x_api_key)
+    chat_raw, chat_h = _first_header(request, _CHAT_HEADERS)
+    chat = _clean_part(chat_raw, 36)
+    admin = _is_admin(x_admin_key)
+
+    if kind == "user":
+        # المستخدم يحدده المفتاح فقط؛ الدردشة مجرد مساحة فرعية داخل مساحته
+        deny = rec.get("deny")
+        return Identity(
+            _compose(rec["user"], chat),
+            "user-key" + (f"+{chat_h}" if chat else ""),
+            kind, rec["user"], admin or bool(rec.get("admin")),
+            tuple(deny) if isinstance(deny, list) else DEFAULT_USER_DENY,
+        )
+
+    # master / open: بوابة موثوقة تؤكد الهوية بالهيدرز
+    user_raw, user_h = _first_header(request, _USER_HEADERS)
+    user = _clean_part(user_raw, 24)
+    cid = _compose(user, chat)
+    if cid:
+        src = "+".join(h for h, v in ((user_h, user), (chat_h, chat)) if v)
+        return Identity(cid, src, kind, user, admin, ())
     if x_api_key:
-        return hashlib.sha256(x_api_key.encode()).hexdigest()[:16], "api-key-hash"
-    return "anonymous", "none"
+        return Identity(hashlib.sha256(x_api_key.encode()).hexdigest()[:16], "api-key-hash", kind, "", admin, ())
+    return Identity("anonymous", "none", kind, "", admin, ())
 
 
 # ══════════════════════════════════════════════════════════
 # ★ عزل المستخدمين: مساحة عمل لكل دردشة + sandbox للمسارات + تقييد اختياري لأدوات الكود الحر
 #   نقطة فرض واحدة داخل /call — لا تغيير في الأدوات نفسها.
-#   (هوية العميل _resolve_client_id وأدوات tools.py المحلية معزولة أصلاً أعلاه وفي hub.py)
+#   (هوية العميل _identify وأدوات tools.py المحلية معزولة أصلاً أعلاه وفي hub.py)
 #   ملاحظة: هذا عزل ضد الخلط والأخطاء (best-effort)، وليس حاجزاً ضد مستخدم خبيث.
 # ══════════════════════════════════════════════════════════
 # أدوات تنفّذ كوداً حراً (تكسر العزل). تعمل لأي أحد ما لم تضبط ADMIN_SECRET؛
@@ -1498,9 +1690,14 @@ def _is_admin(x_admin_key: str) -> bool:
     return bool(ADMIN_SECRET) and hmac.compare_digest((x_admin_key or "").encode(), ADMIN_SECRET.encode())
 
 
-def _is_restricted_denied(tool: str, x_admin_key: str) -> bool:
-    """True إذا كانت الأداة مقيّدة والمتصل ليس admin (يُطبَّق فقط عند ضبط ADMIN_SECRET)."""
-    return bool(ADMIN_SECRET) and tool in RESTRICTED_TOOLS and not _is_admin(x_admin_key)
+def _tool_denied(ident: "Identity", tool: str) -> str:
+    """يعيد سبب المنع (نص) أو '' إذا مسموح."""
+    if tool in RESTRICTED_TOOLS and not ident.is_admin and (ident.kind == "user" or ADMIN_SECRET):
+        return "مقيّدة (تتطلب صلاحية admin)"
+    for pat in ident.deny:
+        if fnmatch.fnmatchcase(tool, pat):
+            return "غير متاحة لهذا المستخدم"
+    return ""
 
 
 def workspace_for(client_id: str) -> Path:
@@ -1613,6 +1810,8 @@ async def health():
         "anonymous_calls": _stats["anonymous_calls"],
         "require_client_id": REQUIRE_CLIENT_ID,
         "auth_required": REQUIRE_AUTH,
+        "per_user_keys": len(_load_clients()),
+        "sign_file_urls": bool(SIGN_FILE_URLS and FILE_SIGNING_KEY),
         "restricted_tools_need_admin": bool(ADMIN_SECRET),
         "space_base_url_set": bool(SPACE_BASE_URL),
         "call_timeout_seconds": CALL_TIMEOUT,
@@ -1657,7 +1856,7 @@ def _shorten(text: str) -> str:
     return text
 
 
-def _build_tools_body(include_restricted: bool = True) -> bytes:
+def _build_tools_body(include_restricted: bool = True, deny: Tuple[str, ...] = ()) -> bytes:
     all_tools = list(TOOLS_MANIFEST)
     seen_names = {t["function"]["name"] for t in all_tools}
 
@@ -1688,6 +1887,13 @@ def _build_tools_body(include_restricted: bool = True) -> bytes:
             except Exception as e:
                 logger.warning(f"Skipping tool {tool_name} due to error: {e}")
 
+    if deny or not include_restricted:
+        all_tools = [
+            t for t in all_tools
+            if not (not include_restricted and t["function"]["name"] in RESTRICTED_TOOLS)
+            and not any(fnmatch.fnmatchcase(t["function"]["name"], pat) for pat in deny)
+        ]
+
     body = json.dumps(
         {"tools": all_tools},
         ensure_ascii=False, separators=(",", ":"),
@@ -1697,19 +1903,26 @@ def _build_tools_body(include_restricted: bool = True) -> bytes:
 
 
 @app.get("/tools")
-async def list_tools(x_admin_key: str = Header(default="")):
-    # عند ضبط ADMIN_SECRET تُخفى أدوات الكود الحر عمّن لا يملك X-Admin-Key
-    include_restricted = (not ADMIN_SECRET) or _is_admin(x_admin_key)
+async def list_tools(x_admin_key: str = Header(default=""), x_api_key: str = Header(default="")):
+    # القائمة تبقى مفتوحة بلا مفتاح؛ إذا أُرسل مفتاح مستخدم تُخفى عنه الأدوات المقيّدة/الممنوعة
+    rec = _lookup_user(x_api_key)
+    admin = _is_admin(x_admin_key) or bool(rec and rec.get("admin"))
+    if rec:
+        include_restricted = admin
+        deny = tuple(rec["deny"]) if isinstance(rec.get("deny"), list) else DEFAULT_USER_DENY
+    else:
+        include_restricted = (not ADMIN_SECRET) or admin
+        deny = ()
     key = (
         len(TOOLS_MANIFEST),
         len(registry.tool_routes) if hasattr(registry, "tool_routes") else 0,
-        bool(video_session), TOOLS_DESC_MAX, HIDE_TOOL_PREFIXES, include_restricted,
+        bool(video_session), TOOLS_DESC_MAX, HIDE_TOOL_PREFIXES, include_restricted, deny,
     )
     body = _tools_cache.get(key)
     if body is None:
-        if len(_tools_cache) > 8:
+        if len(_tools_cache) > 16:
             _tools_cache.clear()
-        body = _tools_cache[key] = _build_tools_body(include_restricted)
+        body = _tools_cache[key] = _build_tools_body(include_restricted, deny)
     return Response(content=body, media_type="application/json")
 
 
@@ -1744,7 +1957,7 @@ async def upload_file(
     x_api_key: str = Header(default=""),
     x_client_id: str = Header(default=""),
 ):
-    _check_auth(x_api_key)
+    ident = _identify(request, x_api_key)
     orig_ext = Path(file.filename or "").suffix.lower() or ""
     if orig_ext not in ALLOWED_UPLOAD_EXTS:
         raise HTTPException(
@@ -1754,8 +1967,7 @@ async def upload_file(
         )
 
     # ★ عزل الملفات بحسب client_id
-    cid, _src = _resolve_client_id(request, x_api_key)
-    safe_client = "".join(c for c in cid if c.isalnum() or c in "-_")[:32] or "anonymous"
+    safe_client = _safe_client_name(ident.client_id)
     user_dir = FILES_DIR / safe_client
     user_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1806,7 +2018,7 @@ async def composio_disconnect_endpoint(
     ★ endpoint برمجي مباشر لتسجيل الخروج من Composio.
     لا يحتاج وكيل — يمكن استدعاؤه من أي كود خارجي.
     """
-    _check_auth(x_api_key)
+    _check_master(x_api_key)
     return await composio_revoke_account(connected_account_id)
 
 
@@ -1819,10 +2031,9 @@ async def call_tool(
     x_client_id: str = Header(default=""),
     x_admin_key: str = Header(default=""),
 ):
-    _check_auth(x_api_key)
-
-    # ★ حساب client_id وضبطه في السياق لتعزيل الملفات
-    client_id, id_source = _resolve_client_id(request, x_api_key)
+    # ★ المصادقة + تحديد الهوية (مستخدم + دردشة) في خطوة واحدة
+    ident = _identify(request, x_api_key, x_admin_key)
+    client_id, id_source = ident.client_id, ident.source
     if id_source == "none":
         _stats["anonymous_calls"] += 1
         if REQUIRE_CLIENT_ID:
@@ -1836,25 +2047,30 @@ async def call_tool(
                 f"(مشتركة بين كل المستخدمين). عدد هذه الطلبات: {_stats['anonymous_calls']}"
             )
     response.headers["X-Client-Id-Used"] = _safe_client_name(client_id)
+    logger.info(f"📥 /call tool={req.tool} client={_safe_client_name(client_id)} source={id_source} kind={ident.kind}")
     _current_client_id.set(client_id)
 
-    # ★ أدوات الكود الحر: لمن يملك X-Admin-Key فقط (عند ضبط ADMIN_SECRET)
-    if _is_restricted_denied(req.tool, x_admin_key):
-        raise HTTPException(403, f"الأداة {req.tool} مقيّدة (تتطلب X-Admin-Key)")
+    # ★ الأدوات المقيّدة/الممنوعة لهذا المستخدم
+    why = _tool_denied(ident, req.tool)
+    if why:
+        raise HTTPException(403, f"الأداة {req.tool} {why}")
 
     ws = workspace_for(client_id)
-    ws_url = _full_file_url(f"/files/{ws.name}/")
+    # مع الروابط الموقّعة لا يصلح رابط المجلد (كل ملف يحتاج توقيعه)، فلا نعرضه
+    ws_url = "" if SIGN_FILE_URLS else _full_file_url(f"/files/{ws.name}/")
 
     before = await asyncio.to_thread(_snapshot, ws)
 
     async def ok(result):
         after = await asyncio.to_thread(_snapshot, ws)
-        return {
+        out = {
             "ok": True,
-            "result": result,
-            "workspace_url": ws_url,
+            "result": _sign_result_urls(result) if SIGN_FILE_URLS else result,
             "files_changed": _diff_snapshots(before, after, ws.name),
         }
+        if ws_url:
+            out["workspace_url"] = ws_url
+        return out
 
     # 1. أدوات الفيديو
     if req.tool in video_tool_names:
