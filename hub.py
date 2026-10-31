@@ -29,6 +29,18 @@ from dependency_injector import DependencyInjector
 
 logger = logging.getLogger("hub")
 
+SPACE_BASE_URL = os.environ.get("SPACE_BASE_URL", "")
+
+
+def _safe_client_name(client_id: str) -> str:
+    """نفس قاعدة main.py لتنظيف معرّف العميل (منع path traversal)."""
+    return "".join(c for c in (client_id or "") if c.isalnum() or c in "-_")[:32] or "anonymous"
+
+
+def _full_url(relative_path: str) -> str:
+    base = SPACE_BASE_URL.rstrip("/") if SPACE_BASE_URL else ""
+    return f"{base}{relative_path}" if base else relative_path
+
 # ★ المهلة الافتراضية لإقلاع كل سيرفر MCP (اتصال + list_tools)
 DEFAULT_STARTUP_TIMEOUT = float(os.environ.get("MCP_STARTUP_TIMEOUT", "60"))
 
@@ -256,23 +268,46 @@ class LocalRuntime:
         self.tool = tool
         self.injector = injector
 
-    async def invoke(self, user_arguments: Dict[str, Any], request: Optional[Request] = None) -> Any:
+    async def invoke(
+        self,
+        user_arguments: Dict[str, Any],
+        request: Optional[Request] = None,
+        client_id: str = "anonymous",
+    ) -> Any:
         try:
             full_args = self.injector.resolve_dependencies(
                 tool_name=self.tool.name,
                 user_args=user_arguments
             )
-            if request is not None:
-                sig = inspect.signature(self.tool.callable)
-                if "request" in sig.parameters:
-                    full_args["request"] = request
             sig = inspect.signature(self.tool.callable)
-            if "files_dir" in sig.parameters and "files_dir" not in full_args:
-                full_args["files_dir"] = Path.cwd() / "files"
+            if request is not None and "request" in sig.parameters:
+                full_args["request"] = request
+
+            # ★ FIX: عزل الملفات لكل عميل. نفرض files_dir = files/<client_id>/ دائماً
+            #   (حتى لو وفّره الـ injector) بدل المجلد المشترك files/
+            safe_client = _safe_client_name(client_id)
+            user_dir = None
+            if "files_dir" in sig.parameters:
+                user_dir = Path.cwd() / "files" / safe_client
+                user_dir.mkdir(parents=True, exist_ok=True)
+                full_args["files_dir"] = user_dir
+
             if asyncio.iscoroutinefunction(self.tool.callable):
-                return await self.tool.callable(**full_args)
+                result = await self.tool.callable(**full_args)
             else:
-                return self.tool.callable(**full_args)
+                result = self.tool.callable(**full_args)
+
+            # ★ FIX: تصحيح الرابط ليشمل مجلد العميل ويصبح كاملاً
+            if user_dir is not None and isinstance(result, dict) and result.get("local_path"):
+                try:
+                    p = Path(result["local_path"])
+                    if p.parent == user_dir:
+                        rel = f"/files/{safe_client}/{p.name}"
+                        result["relative_path"] = rel
+                        result["file_url"] = _full_url(rel)
+                except Exception:
+                    pass
+            return result
         except Exception as e:
             raise ToolExecutionError(f"Local tool error: {e}")
 
@@ -442,7 +477,7 @@ class MCPRegistry:
         real_name = self.local_aliases.get(public_name, public_name)
         if real_name in self.local_runtimes:
             try:
-                result = await self.local_runtimes[real_name].invoke(arguments, request=request)
+                result = await self.local_runtimes[real_name].invoke(arguments, request=request, client_id=client_id)
                 return {"ok": True, "result": result}
             except ToolExecutionError:
                 raise
