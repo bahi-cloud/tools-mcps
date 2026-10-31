@@ -14,6 +14,7 @@ import inspect
 import time
 import os
 import re
+import hashlib
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass, field
@@ -33,8 +34,14 @@ SPACE_BASE_URL = os.environ.get("SPACE_BASE_URL", "")
 
 
 def _safe_client_name(client_id: str) -> str:
-    """نفس قاعدة main.py لتنظيف معرّف العميل (منع path traversal)."""
-    return "".join(c for c in (client_id or "") if c.isalnum() or c in "-_")[:32] or "anonymous"
+    """اسم مجلد آمن وثابت لكل هوية (ASCII فقط). يجب أن تطابق نسخة hub.py تماماً."""
+    cid = (client_id or "").strip()
+    if not cid:
+        return "anonymous"
+    clean = "".join(c for c in cid if c.isascii() and (c.isalnum() or c in "-_"))
+    if clean != cid or len(clean) > 64:
+        return "c_" + hashlib.sha256(cid.encode("utf-8")).hexdigest()[:32]
+    return clean
 
 
 def _full_url(relative_path: str) -> str:
